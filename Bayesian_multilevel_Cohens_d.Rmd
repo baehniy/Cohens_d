@@ -1,0 +1,2766 @@
+#Packages
+```{r}
+library(tidyverse)
+library(plyr)
+library(brms)
+library(performance)
+library(effectsize)
+library(stats)
+library(latex2exp)
+library(ggplot2)
+library(lme4)
+library(lmerTest)
+library(tidybayes)
+
+#Global Settings
+set.seed(0)
+size <- 18
+
+#Load Pre-Sampled Models
+load("models/ANOVA_1.RObject")
+load("models/ANOVA_1_skew.RObject")
+load("models/ANOVA_2.RObject")
+load("models/ANOVA_3.RObject")
+load("models/ANOVA_3_student.RObject")
+```
+
+#Functions
+```{r}
+#This is the main function used to extract all posterior samples from the 4 Markov chains
+get_chains <- function(brmsmodel){
+  chain.1 <- as.data.frame(as_draws(brmsmodel)[1]) %>% rename_all(~stringr::str_replace(.,"^X1.",""))
+  chain.2 <- as.data.frame(as_draws(brmsmodel)[2]) %>% rename_all(~stringr::str_replace(.,"^X2.",""))
+  chain.3 <- as.data.frame(as_draws(brmsmodel)[3]) %>% rename_all(~stringr::str_replace(.,"^X3.",""))
+  chain.4 <- as.data.frame(as_draws(brmsmodel)[4]) %>% rename_all(~stringr::str_replace(.,"^X4.",""))
+
+  chains <- suppressMessages(join_all(list(chain.1, chain.2, chain.3, chain.4), type = 'full'))
+  return(chains)
+}
+
+invlogit <- function(x){return(1/(1 + exp(-x)))}
+sigma_ZOIB <- function(mu, phi){return(sqrt((mu * (1 - mu))/(exp(phi) + 1)))}
+
+sdlog <- function(m, s) sqrt(log(1 + (s^2 / m^2)))
+meanlog <- function(m, s) log(m) - (sdlog(m, s)^2) / 2
+
+bias <- function(x, theta){
+  if (theta == 0){
+    return(round(100 * mean(x, na.rm = TRUE), 3))
+  } else {
+    return(round(100 * (mean(x - theta, na.rm = TRUE))/theta, 3))
+  }
+}
+
+mse <- function(x, theta){
+  if (theta == 0){
+    return(round(100 * (mean(x^2, na.rm = TRUE)), 3))
+  } else {
+    return(round(100 * mean((x - theta)^2, na.rm = TRUE)/theta^2, 3))
+  }
+}
+
+mcse <- function(x, theta){
+  if (theta == 0){
+    return(100 * round(sd(x, na.rm = TRUE)/sqrt(n_rep), 3))
+  } else {
+    return(100 * round(sd(x, na.rm = TRUE)/(theta * sqrt(n_rep)), 3))
+  }
+}
+```
+
+#Preparing the Data
+```{r}
+#Reading in the raw data file from (Edelsbrunner et al., 2024)
+analyticdata <- readRDS("data/analyticdata.rds")
+alles <- analyticdata[[3]]
+alles <- alles %>% mutate(class = paste0(teacher_id, student_grade_pre))
+dat <- alles %>% select(c(student_id, Treatment4, class, gesamtscore_pre, gesamtscore_post))
+
+#Renaming columns for our purposes
+dat <- dat %>% dplyr::rename(
+  id = student_id,
+  cond = Treatment4,
+  pre = gesamtscore_pre,
+  post = gesamtscore_post
+)
+
+table(dat$class)
+# 1415  31#7105     3677     5089     5896     5956     6085     6086     6208     6218     6228     6238     6248     6257     6268 
+#    1        2       41        4        3        3        2        1       42      142       12       17       15       20       13 
+# 6288 631#6288     6327     6367     6368     6388     6418     6438     6498     6508     6578     6588     6608     6617     6688 
+#   25       19       32       22       10        6       13       28       31       11       11        7       37       56       18 
+# 6777     7018     7087     7198     7227     7237 727#7548     7278     7307     7327     7348     7358     7387     7407     7418 
+#   15       42       17       52       18       14       21       14       10       18       12        7       14        8       34 
+# 7428     7437     7447     7457     7467     7608     7628     7637     7807 781#7828 783#7828     8027     8028     8087 809#8107 
+#    7       11       37       16        7       40        2       15       41       20       18       16       19       11       16 
+# 8428     8547     8608     8618     8658     8678     8798     8888     8978     8987 
+#   19       24       13       20        8       11       16       28       19       21 
+
+#Remove classes with only 1 to 4 students. Strictly speaking, this would not be necessary as multilevel
+#modeling also works for classes of size 1. We do this so that the total number of students is comparable to 
+#the published article (Edelsbrunner et al., 2024)
+dat <- dat %>% mutate(cond = ifelse(cond == "Kontrollgruppe", "Control", "Intervention"))
+dat <- dat %>% dplyr::filter(class != "1415")
+dat <- dat %>% dplyr::filter(class != "31#7105")
+dat <- dat %>% dplyr::filter(class != "5089")
+dat <- dat %>% dplyr::filter(class != "5896")
+dat <- dat %>% dplyr::filter(class != "5956")
+dat <- dat %>% dplyr::filter(class != "6085")
+dat <- dat %>% dplyr::filter(class != "6086")
+dat <- dat %>% dplyr::filter(class != "7628")
+
+#Dummy coding classes
+for (i in 1:length(unique(dat$class))) {
+  dat <- dat %>% mutate(class = ifelse(class == (unique(dat$class))[i], i, class))
+}
+
+#Convert sum scores to solution rates (max. 26 points in pretest/posttest)
+dat <- dat %>% mutate(
+  cond = as.factor(cond),
+  class = as.numeric(class),
+  pre = pre,
+  post = post
+)
+
+#Filter conditions
+control <- dat %>% filter(cond == "Control")
+intervention <- dat %>% filter(cond == "Intervention")
+
+n_1 <- nrow(control)#939
+n_2 <- nrow(intervention)#438
+n <- n_1 + n_2#1377
+
+#Convert wide format of data to long format
+dat_long <- dat %>% pivot_longer(
+  cols = c("pre", "post"),
+  names_to = "time",
+  values_to = "score"
+)
+
+dat_long <- dat_long %>% mutate(time = fct_relevel(time, "pre", "post"))
+
+#Violin Plot of Scores
+ggplot(dat_long, aes(time, score, fill = cond)) +
+  geom_violin(aes(fill = cond), trim = TRUE, alpha = 1/5, scale = "count") +
+  geom_boxplot(width = 0.1, position = position_dodge(0.9), alpha = 1/5) + stat_summary(fun=mean, colour="black", geom="point", shape=5, size=3, show.legend=TRUE,position = position_dodge(0.9)) + stat_summary(aes(label=round(after_stat(y),2)), geom="text", size=6, vjust = 0.5, hjust = -0.6, position = position_dodge(0.9)) + scale_x_discrete(labels = c("Pretest", "Posttest")) + xlab("") + ylim(0, 26) + ylab("Sum Score (Max. = 26 Points)") + theme_classic(base_size = size - 2) + labs(fill = "Condition") + scale_fill_grey() + scale_color_grey() + labs(color='') 
+```
+
+#Modelling Aspects
+##Bayesian Repeated-Measures ANOVA Model (no multilevel structure, no heterogeneous residual variances)
+###Gaussian Distribution
+```{r}
+#Default Settings in brms:
+# - Number of MCMC chains = 4
+# - iter = 2000
+# - warm-up = floor(iter/2) = 1000
+# - thin = 1
+# - seed = NA
+# - adapt_delta = 0.95
+# - max_treedepth = 10
+
+#Default Prior Distributions
+get_prior(bf(score ~ 0 + time * cond + (1|id)), 
+  data = dat_long)
+ #               prior class                      coef group resp dpar nlpar lb ub       source
+ #               (flat)     b                                                            default
+ #               (flat)     b          condIntervention                             (vectorized)
+ #               (flat)     b                  timepost                             (vectorized)
+ #               (flat)     b timepost:condIntervention                             (vectorized)
+ #               (flat)     b                   timepre                             (vectorized)
+ # student_t(3, 0, 2.5)    sd                                                  0         default
+ # student_t(3, 0, 2.5)    sd                              id                  0    (vectorized)
+ # student_t(3, 0, 2.5)    sd                 Intercept    id                  0    (vectorized)
+ # student_t(3, 0, 2.5) sigma                                                  0         default
+
+ANOVA_1 <- brm(
+  bf(score ~ 0 + time * cond + (1|id)), 
+  data = dat_long, 
+  seed = 0
+)
+
+plot(ANOVA_1)
+save(ANOVA_1, file = "ANOVA_1.RObject")
+
+pp_check(ANOVA_1, ndraws = 100) + theme_classic(base_size = size) + ylab("Density") + xlab("Score") + scale_fill_grey() + scale_color_grey() + labs(color='') 
+
+#Grouped pp-Checks
+#Dense Overlay
+pp_check(ANOVA_1, ndraws = 100, type = "dens_overlay_grouped", group = "cond")
+pp_check(ANOVA_1, ndraws = 100, type = "dens_overlay_grouped", group = "time")
+
+#Residual Error
+pp_check(ANOVA_1, type = "error_scatter_avg_grouped", group = "cond")
+pp_check(ANOVA_1, type = "error_scatter_avg_grouped", group = "time")
+
+#PIT-ECDF
+pp_check(ANOVA_1, ndraws = 100, type = "pit_ecdf_grouped", group = "cond")
+pp_check(ANOVA_1, ndraws = 100, type = "pit_ecdf_grouped", group = "time")
+
+summary(ANOVA_1, prob = 0.95)
+#  Family: gaussian 
+#   Links: mu = identity; sigma = identity 
+# Formula: score ~ 0 + time * cond + (1 | id) 
+#    Data: dat_long (Number of observations: 2754) 
+#   Draws: 4 chains, each with iter = 2000; warmup = 1000; thin = 1;
+#          total post-warmup draws = 4000
+# 
+# Multilevel Hyperparameters:
+# ~id (Number of levels: 1377) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     2.56      0.10     2.35     2.76 1.00      928     1821
+# 
+# Regression Coefficients:
+#                           Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# timepre                       9.63      0.14     9.36     9.90 1.00     2540     2871
+# timepost                     15.63      0.14    15.36    15.91 1.00     2767     2668
+# condIntervention              1.08      0.25     0.61     1.56 1.00     2501     2636
+# timepost:condIntervention    -0.14      0.28    -0.69     0.41 1.00     3102     2837
+# 
+# Further Distributional Parameters:
+#       Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sigma     3.46      0.06     3.33     3.59 1.00     1281     2082
+# 
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+```
+
+###Skew-Normal Distribution
+```{r}
+ANOVA_1_skew <- brm(
+  bf(score ~ 0 + time * cond + (1|id)), 
+  data = dat_long, 
+  family = skew_normal(),
+  seed = 0
+)
+
+get_prior(ANOVA_1_skew)
+ #                prior class                      coef group resp dpar nlpar lb ub       source
+ #         normal(0, 4) alpha                                                            default
+ #               (flat)     b                                                            default
+ #               (flat)     b          condIntervention                             (vectorized)
+ #               (flat)     b                  timepost                             (vectorized)
+ #               (flat)     b timepost:condIntervention                             (vectorized)
+ #               (flat)     b                   timepre                             (vectorized)
+ # student_t(3, 0, 2.5)    sd                                                  0         default
+ # student_t(3, 0, 2.5)    sd                              id                  0    (vectorized)
+ # student_t(3, 0, 2.5)    sd                 Intercept    id                  0    (vectorized)
+ # student_t(3, 0, 2.5) sigma                                                  0         default
+
+plot(ANOVA_1_skew)
+save(ANOVA_1_skew, file = "ANOVA_1_skew.RObject")
+
+pp_check(ANOVA_1_skew, ndraws = 100) + theme_classic(base_size = size) + ylab("Density") + xlab("Score")
+
+#Grouped pp-Checks
+#Dense Overlay
+pp_check(ANOVA_1_skew, ndraws = 100, type = "dens_overlay_grouped", group = "cond")
+pp_check(ANOVA_1_skew, ndraws = 100, type = "dens_overlay_grouped", group = "time")
+
+#Residual Error
+pp_check(ANOVA_1_skew, type = "error_scatter_avg_grouped", group = "cond")
+pp_check(ANOVA_1_skew, type = "error_scatter_avg_grouped", group = "time")
+
+#PIT-ECDF
+pp_check(ANOVA_1_skew, ndraws = 100, type = "pit_ecdf_grouped", group = "cond")
+pp_check(ANOVA_1_skew, ndraws = 100, type = "pit_ecdf_grouped", group = "time")
+
+summary(ANOVA_1_skew, prob = 0.95)
+# sFamily: skew_normal 
+#   Links: mu = identity; sigma = identity; alpha = identity 
+# Formula: score ~ 0 + time * cond + (1 | id) 
+#    Data: dat_long (Number of observations: 2754) 
+#   Draws: 4 chains, each with iter = 2000; warmup = 1000; thin = 1;
+#          total post-warmup draws = 4000
+# 
+# Multilevel Hyperparameters:
+# ~id (Number of levels: 1377) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     2.56      0.10     2.36     2.76 1.00     1068     1540
+# 
+# Regression Coefficients:
+#                           Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# timepre                       9.57      0.14     9.29     9.85 1.00     2183     2531
+# timepost                     15.72      0.14    15.44    16.00 1.00     2534     3023
+# condIntervention              1.08      0.25     0.59     1.57 1.00     1843     2710
+# timepost:condIntervention    -0.17      0.28    -0.73     0.37 1.00     3610     2855
+# 
+# Further Distributional Parameters:
+#       Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sigma     3.46      0.07     3.32     3.59 1.00     1539     2202
+# alpha    -1.34      0.31    -1.90    -0.71 1.00     1179     1310
+# 
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+```
+
+##Bayesian Repeated-Measures ANOVA Model (no multilevel structure, with heterogeneous residual variances)
+```{r}
+#General Model Check
+check_model(lmer(score ~ 0 + time * cond + (1|id), data = dat_long))
+check_normality(lmer(score ~ 0 + time * cond + (1|id), data = dat_long))
+
+ANOVA_2 <- brm(
+  bf(score ~ 0 + time * cond + (1|id), sigma ~ 0 + time * cond), 
+  data = dat_long,
+  seed = 0
+)
+
+plot(ANOVA_2)
+save(ANOVA_2, file = "ANOVA_2.RObject")
+
+pp_check(ANOVA_2, ndraws = 100) + theme_classic(base_size = size) + ylab("Density") + xlab("Score") + scale_fill_grey() + scale_color_grey() + labs(color = '') 
+pp_check(ANOVA_2, type = "error_scatter_avg") + theme_classic(base_size = size)
+
+#Grouped pp-Checks
+#Dense Overlay
+pp_check(ANOVA_2, ndraws = 100, type = "dens_overlay_grouped", group = "cond")
+pp_check(ANOVA_2, ndraws = 100, type = "dens_overlay_grouped", group = "time")
+
+#Residual Error
+pp_check(ANOVA_2, type = "error_scatter_avg_grouped", group = "cond")
+pp_check(ANOVA_2, type = "error_scatter_avg_grouped", group = "time")
+
+#ECDF
+pp_check(ANOVA_2, ndraws = 100, type = "ecdf_overlay_grouped", group = "cond")
+pp_check(ANOVA_2, ndraws = 100, type = "ecdf_overlay_grouped", group = "time")
+
+#PIT
+pp_check(ANOVA_2, ndraws = 100, type = "pit_ecdf_grouped", group = "cond")
+pp_check(ANOVA_2, ndraws = 100, type = "pit_ecdf_grouped", group = "time")
+
+summary(ANOVA_2, prob = 0.95)
+#  Family: gaussian 
+#   Links: mu = identity; sigma = log 
+# Formula: score ~ 0 + time * cond + (1 | id) 
+#          sigma ~ 0 + time * cond
+#    Data: dat_long (Number of observations: 2754) 
+#   Draws: 4 chains, each with iter = 2000; warmup = 1000; thin = 1;
+#          total post-warmup draws = 4000
+# 
+# Multilevel Hyperparameters:
+# ~id (Number of levels: 1377) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     2.57      0.10     2.37     2.77 1.00      855     1463
+# 
+# Regression Coefficients:
+#                                 Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# timepre                             9.64      0.12     9.40     9.88 1.00     2869     2851
+# timepost                           15.63      0.16    15.31    15.95 1.00     3514     2994
+# condIntervention                    1.07      0.22     0.63     1.50 1.00     2826     3010
+# timepost:condIntervention          -0.14      0.28    -0.71     0.40 1.00     6124     2865
+# sigma_timepre                       1.02      0.04     0.93     1.10 1.00     1168     1907
+# sigma_timepost                      1.40      0.03     1.34     1.46 1.00     3472     2792
+# sigma_condIntervention              0.03      0.07    -0.10     0.15 1.00     1828     2446
+# sigma_timepost:condIntervention    -0.06      0.09    -0.23     0.11 1.00     2042     2306
+# 
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+```
+
+##Bayesian Repeated-Measures ANOVA Model (with multilevel structure, with heterogeneous residual variances)
+```{r}
+#Bayesian Intraclass Correlation Coefficient
+icc <- brm(
+  bf(post ~ (1|class)), 
+  data = dat, 
+  family = skew_normal(),
+  seed = 0
+)
+
+pp_check(icc, ndraws = 100) + theme_classic(base_size = size) + ylab("Density") + xlab("Posttest Solution Rate")
+performance::variance_decomposition(icc, ci = 0.95)
+# # Random Effect Variances and ICC
+# 
+# Conditioned on: all random effects
+# 
+# ## Variance Ratio (comparable to ICC)
+# Ratio: 0.17  CI 95%: [0.06 0.26]
+# 
+# ## Variances of Posterior Predicted Distribution
+# Conditioned on fixed effects: 18.90  CI 95%: [16.83 21.14]
+# Conditioned on rand. effects: 22.70  CI 95%: [20.43 25.26]
+# 
+# ## Difference in Variances
+# Difference: 3.81  CI 95%: [1.34 6.34]
+
+#General Model Check
+check_model(lmer(score ~ 0 + time * cond + (1|id) + (0 + time * cond||class), data = dat_long))
+check_normality(lmer(score ~ 0 + time * cond + (1|id) + (0 + time * cond||class), data = dat_long))
+
+ANOVA_3 <- brm(
+  bf(score ~ 0 + time * cond + (1|id) + (0 + time * cond|class), 
+     sigma ~ 0 + time * cond + (0 + time * cond|class)), 
+  data = dat_long, 
+  prior = c(
+    prior(normal(13, 7), class = "b"),
+    prior(normal(1, 2), class = "b", dpar = "sigma")
+  ),
+  warmup = 2500,
+  iter = 5000,
+  cores = parallel::detectCores(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  save_pars = save_pars(all = TRUE),
+  seed = 0
+)
+
+loo <- loo(ANOVA_3)
+# Computed from 10000 by 2754 log-likelihood matrix.
+# 
+#          Estimate   SE
+# elpd_loo  -7497.9 36.2
+# p_loo       846.3 17.6
+# looic     14995.8 72.3
+# ------
+# MCSE of elpd_loo is NA.
+# MCSE and ESS estimates assume MCMC draws (r_eff in [0.3, 2.1]).
+# 
+# Pareto k diagnostic values:
+#                          Count Pct.    Min. ESS
+# (-Inf, 0.7]   (good)     2628  95.4%   258     
+#    (0.7, 1]   (bad)       126   4.6%   <NA>    
+#    (1, Inf)   (very bad)    0   0.0%   <NA>    
+# See help('pareto-k-diagnostic') for details.
+plot(ANOVA_3)
+save(ANOVA_3, file = "ANOVA_3.RObject")
+pp_check(ANOVA_3, ndraws = 100)
+
+#Grouped pp-Checks
+#Dense Overlay
+pp_check(ANOVA_3, ndraws = 100, type = "dens_overlay_grouped", group = "cond")
+pp_check(ANOVA_3, ndraws = 100, type = "dens_overlay_grouped", group = "time")
+pp_check(ANOVA_3, ndraws = 100, type = "dens_overlay_grouped", group = "class")
+
+#Residual Error
+pp_check(ANOVA_3, type = "error_scatter_avg_grouped", group = "cond")
+pp_check(ANOVA_3, type = "error_scatter_avg_grouped", group = "time")
+pp_check(ANOVA_3, type = "error_scatter_avg_grouped", group = "class")
+
+#ECDF
+pp_check(ANOVA_3, ndraws = 100, type = "ecdf_overlay_grouped", group = "cond")
+pp_check(ANOVA_3, ndraws = 100, type = "ecdf_overlay_grouped", group = "time")
+pp_check(ANOVA_3, ndraws = 100, type = "ecdf_overlay_grouped", group = "class")
+
+#PIT
+pp_check(ANOVA_3, ndraws = 100, type = "pit_ecdf")
+# Evaluating models with a standard Probability Integral Transform (PIT) or standard ECDF can
+# suffer from the PIT pulling posterior draws too tightly toward the center (due to the "double
+# use" of data). Using LOO-PIT ECDF (Leave-One-Out PIT Empirical Cumulative Distribution
+# Function) solves this problem by assessing model calibration securely.
+pp_check(ANOVA_3, ndraws = 100, type = "loo_pit_ecdf")
+pp_check(ANOVA_3, ndraws = 100, type = "pit_ecdf_grouped", group = "class")
+
+pp_check(ANOVA_3, type = "error_scatter_avg") + theme_classic(base_size = size)
+summary(ANOVA_3, prob = 0.95)
+#  Family: gaussian 
+#   Links: mu = identity; sigma = log 
+# Formula: score ~ 0 + time * cond + (1 | id) + (0 + time * cond | class) 
+#          sigma ~ 0 + time * cond + (0 + time * cond | class)
+#    Data: dat_long (Number of observations: 2754) 
+#   Draws: 4 chains, each with iter = 5000; warmup = 2500; thin = 1;
+#          total post-warmup draws = 10000
+# 
+# Multilevel Hyperparameters:
+# ~class (Number of levels: 62) 
+#                                                             Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(timepre)                                                     1.26      0.18     0.93     1.65 1.00     3247     5146
+# sd(timepost)                                                    2.24      0.27     1.75     2.83 1.00     2788     4834
+# sd(condIntervention)                                            0.58      0.35     0.03     1.32 1.00     1478     2800
+# sd(timepost:condIntervention)                                   0.96      0.60     0.05     2.22 1.00     1315     3480
+# sd(sigma_timepre)                                               0.09      0.05     0.01     0.21 1.00     1135     2720
+# sd(sigma_timepost)                                              0.09      0.05     0.00     0.19 1.00     1659     2578
+# sd(sigma_condIntervention)                                      0.10      0.07     0.00     0.24 1.00     2468     4718
+# sd(sigma_timepost:condIntervention)                             0.10      0.08     0.00     0.29 1.00     2959     4198
+# cor(timepre,timepost)                                           0.14      0.17    -0.21     0.45 1.00     1521     2709
+# cor(timepre,condIntervention)                                  -0.02      0.39    -0.71     0.76 1.00     5477     6043
+# cor(timepost,condIntervention)                                  0.05      0.38    -0.67     0.78 1.00     5975     6689
+# cor(timepre,timepost:condIntervention)                         -0.03      0.37    -0.74     0.69 1.00     6672     5677
+# cor(timepost,timepost:condIntervention)                        -0.34      0.35    -0.85     0.51 1.00     5452     4826
+# cor(condIntervention,timepost:condIntervention)                -0.06      0.43    -0.82     0.77 1.00     2940     5598
+# cor(sigma_timepre,sigma_timepost)                               0.11      0.42    -0.73     0.83 1.00     3315     5375
+# cor(sigma_timepre,sigma_condIntervention)                      -0.01      0.44    -0.80     0.79 1.00     5239     6292
+# cor(sigma_timepost,sigma_condIntervention)                     -0.10      0.45    -0.86     0.76 1.00     4351     5996
+# cor(sigma_timepre,sigma_timepost:condIntervention)              0.02      0.44    -0.80     0.82 1.00     8105     7241
+# cor(sigma_timepost,sigma_timepost:condIntervention)            -0.17      0.45    -0.89     0.75 1.00     5633     6680
+# cor(sigma_condIntervention,sigma_timepost:condIntervention)    -0.12      0.45    -0.86     0.76 1.00     7159     7152
+# 
+# ~id (Number of levels: 1377) 
+#               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(Intercept)     2.46      0.09     2.28     2.65 1.00     2391     4877
+# 
+# Regression Coefficients:
+#                                 Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# timepre                             9.49      0.21     9.08     9.91 1.00     3719     5286
+# timepost                           15.32      0.34    14.64    15.97 1.00     2518     4030
+# condIntervention                    0.99      0.29     0.40     1.54 1.00     5456     6038
+# timepost:condIntervention           0.07      0.39    -0.67     0.85 1.00     6434     5234
+# sigma_timepre                       0.93      0.05     0.84     1.02 1.00     2474     4296
+# sigma_timepost                      1.25      0.04     1.17     1.31 1.00     5150     4878
+# sigma_condIntervention              0.03      0.08    -0.12     0.17 1.00     4133     5259
+# sigma_timepost:condIntervention    -0.03      0.10    -0.22     0.17 1.00     4412     5846
+# 
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+# summary(ANOVA_3, prob = 0.90)
+
+#Prior Sensitivity Check via LOO
+ANOVA_3_student <- brm(
+  bf(score ~ 0 + time * cond + (1|id) + (0 + time * cond|class), 
+     sigma ~ 0 + time * cond + (0 + time * cond|class)), 
+  data = dat_long, 
+  family = student(),
+  prior = c(
+    prior(normal(13, 7), class = "b"),
+    prior(normal(1, 2), class = "b", dpar = "sigma")
+  ),
+  warmup = 2500,
+  iter = 5000,
+  cores = parallel::detectCores(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  save_pars = save_pars(all = TRUE),
+  seed = 0
+)
+
+save(ANOVA_3_student, file = "ANOVA_3_student.RObject")
+loo_student <- loo(ANOVA_3_student)
+# Computed from 10000 by 2754 log-likelihood matrix.
+# 
+#          Estimate   SE
+# elpd_loo  -7505.5 36.5
+# p_loo       868.8 17.3
+# looic     15011.0 72.9
+# ------
+# MCSE of elpd_loo is NA.
+# MCSE and ESS estimates assume MCMC draws (r_eff in [0.3, 2.0]).
+# 
+# Pareto k diagnostic values:
+#                          Count Pct.    Min. ESS
+# (-Inf, 0.7]   (good)     2689  97.6%   274     
+#    (0.7, 1]   (bad)        65   2.4%   <NA>    
+#    (1, Inf)   (very bad)    0   0.0%   <NA>    
+# See help('pareto-k-diagnostic') for details.
+loo_compare(loo, loo_student)
+#                 elpd_diff se_diff
+# ANOVA_3          0.0       0.0   
+# ANOVA_3_student -7.6       1.8   
+```
+
+#Between-Group Design
+##Pretest
+```{r}
+cohens_d(intervention$pre, control$pre, pooled_sd = FALSE, paired = FALSE, ci = 0.95)
+# Cohen's d |       95% CI
+# ------------------------
+# 0.28      | [0.17, 0.40]
+
+cohens_d_cl_pr <- data.frame(cl = 1:62, d_s = numeric(62))
+
+for (l in 1:62) {
+  intervention_cl <- intervention %>% filter(class == l)
+  control_cl <- control %>% filter(class == l)
+  cohens_d_cl_pr$d_s[l] <- as.numeric(cohens_d(intervention_cl$pre, control_cl$pre, pooled_sd = FALSE, paired = FALSE, ci = 0.95))[1]
+}  
+
+mean(cohens_d_cl_pr$d_s, na.rm = TRUE)
+```
+
+###Gaussian Distribution
+####Flat Priors
+```{r}
+ttest_pr_gaussian_flat <- brm(bf(
+  pre ~ cond + (0 + cond|class),
+  sigma ~ 0 + cond + (0 + cond|class)),
+  family = gaussian(),
+  data = dat,
+  warmup = 2500,
+  iter = 5000,
+  cores = parallel::detectCores(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  seed = 0
+)
+
+plot(ttest_pr_gaussian_flat)
+
+#Grouped pp-Checks
+#Dense Overlay
+pp_check(ttest_pr_gaussian_flat, ndraws = 100, type = "dens_overlay_grouped", group = "cond")
+pp_check(ttest_pr_gaussian_flat, ndraws = 100, type = "dens_overlay_grouped", group = "class")
+
+#Residual Error
+pp_check(ttest_pr_gaussian_flat, type = "error_scatter_avg_grouped", group = "cond")
+pp_check(ttest_pr_gaussian_flat, type = "error_scatter_avg_grouped", group = "class")
+
+#PIT-ECDF
+pp_check(ttest_pr_gaussian_flat, ndraws = 100, type = "pit_ecdf_grouped", group = "cond")
+pp_check(ttest_pr_gaussian_flat, ndraws = 100, type = "pit_ecdf_grouped", group = "class")
+
+summary(ttest_pr_gaussian_flat, prob = 0.95)
+#  Family: gaussian 
+#   Links: mu = identity; sigma = log 
+# Formula: pre ~ cond + (0 + cond | class) 
+#          sigma ~ 0 + cond + (0 + cond | class)
+#    Data: dat (Number of observations: 1377) 
+#   Draws: 4 chains, each with iter = 5000; warmup = 2500; thin = 1;
+#          total post-warmup draws = 10000
+# 
+# Multilevel Hyperparameters:
+# ~class (Number of levels: 62) 
+#                                               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(condControl)                                   1.28      0.19     0.93     1.70 1.00     3907     6020
+# sd(condIntervention)                              1.30      0.29     0.78     1.90 1.00     4838     6301
+# sd(sigma_condControl)                             0.06      0.03     0.00     0.13 1.00     3472     4550
+# sd(sigma_condIntervention)                        0.09      0.06     0.01     0.22 1.00     2664     4027
+# cor(condControl,condIntervention)                 0.69      0.21     0.18     0.97 1.00     2810     3900
+# cor(sigma_condControl,sigma_condIntervention)     0.18      0.55    -0.91     0.96 1.00     3852     5360
+# 
+# Regression Coefficients:
+#                        Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# Intercept                  9.50      0.22     9.07     9.91 1.00     3907     5917
+# condIntervention           0.92      0.31     0.29     1.53 1.00     6191     7383
+# sigma_condControl          1.26      0.03     1.20     1.31 1.00    10094     6796
+# sigma_condIntervention     1.30      0.04     1.21     1.38 1.00     8290     7275
+# 
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+chains_ttest_pr <- get_chains(ttest_pr_gaussian_flat)
+
+for (l in 1:length(unique(dat$class))) {
+  name <- paste0("d_s_", l, "")
+  name_control <- paste0("r_class.", l, ".condControl.")
+  name_intervention <- paste0("r_class.", l, ".condIntervention.")
+  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
+  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
+  
+  chains_ttest_pr[[name]] <- sqrt(n - 2) * (chains_ttest_pr$b_condIntervention + chains_ttest_pr[names(chains_ttest_pr) == name_intervention] - chains_ttest_pr[names(chains_ttest_pr) == name_control])/sqrt((n_1 - 1) * (exp(2 * chains_ttest_pr$b_sigma_condControl + 2 * chains_ttest_pr[names(chains_ttest_pr) == name_sigma_control] + 2 * chains_ttest_pr$sd_class__sigma_condControl^2) + chains_ttest_pr$sd_class__condControl^2) + (n_2 - 1) * (exp(2 * chains_ttest_pr$b_sigma_condIntervention + 2 * chains_ttest_pr[names(chains_ttest_pr) == name_sigma_intervention] + 2 * chains_ttest_pr$sd_class__sigma_condIntervention^2) + chains_ttest_pr$sd_class__condIntervention^2))
+}
+
+chains_ttest_pr$d_s_mean <- rowMeans(subset(chains_ttest_pr, select = c(d_s_1:d_s_62)), na.rm = TRUE)
+d_s_pr <- round(mean(chains_ttest_pr$d_s_mean), 2) #0.24
+bayestestR::hdi(chains_ttest_pr$d_s_mean, ci = 0.95) #95% HDI: [0.09, 0.38]
+chains_ttest_pr$d_s_sd <- apply(subset(chains_ttest_pr, select = c(d_s_1:d_s_62)), 1, sd)
+d_s_sd_pr <- round(mean(chains_ttest_pr$d_s_sd), 2) #0.25
+bayestestR::hdi(chains_ttest_pr$d_s_sd, ci = 0.95) #95% HDI: [0.10, 0.42]
+```
+
+####Normal Priors
+```{r}
+ttest_pr_gaussian_normal <- brm(bf(
+  pre ~ cond + (0 + cond|class),
+  sigma ~ 0 + cond + (0 + cond|class)),
+  family = gaussian(),
+  data = dat,
+  prior = c(
+    prior(normal(13, 7), class = "b"),
+    prior(normal(1, 2), class = "b", dpar = "sigma")
+  ),
+  warmup = 2500,
+  iter = 5000,
+  cores = parallel::detectCores(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  seed = 0
+)
+
+plot(ttest_pr_gaussian_normal)
+
+#Grouped pp-Checks
+#Dense Overlay
+pp_check(ttest_pr_gaussian_normal, ndraws = 100, type = "dens_overlay_grouped", group = "cond")
+pp_check(ttest_pr_gaussian_normal, ndraws = 100, type = "dens_overlay_grouped", group = "class")
+
+#Residual Error
+pp_check(ttest_pr_gaussian_normal, type = "error_scatter_avg_grouped", group = "cond")
+pp_check(ttest_pr_gaussian_normal, type = "error_scatter_avg_grouped", group = "class")
+
+#PIT-ECDF
+pp_check(ttest_pr_gaussian_normal, ndraws = 100, type = "pit_ecdf_grouped", group = "cond")
+pp_check(ttest_pr_gaussian_normal, ndraws = 100, type = "pit_ecdf_grouped", group = "class")
+
+summary(ttest_pr_gaussian_normal, prob = 0.95)
+#  Family: gaussian 
+#   Links: mu = identity; sigma = log 
+# Formula: pre ~ cond + (0 + cond | class) 
+#          sigma ~ 0 + cond + (0 + cond | class)
+#    Data: dat (Number of observations: 1377) 
+#   Draws: 4 chains, each with iter = 5000; warmup = 2500; thin = 1;
+#          total post-warmup draws = 10000
+# 
+# Multilevel Hyperparameters:
+# ~class (Number of levels: 62) 
+#                                               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(condControl)                                   1.28      0.19     0.94     1.70 1.00     4391     6290
+# sd(condIntervention)                              1.28      0.29     0.76     1.90 1.00     5448     6448
+# sd(sigma_condControl)                             0.06      0.03     0.00     0.13 1.00     3178     3712
+# sd(sigma_condIntervention)                        0.10      0.06     0.01     0.22 1.00     3078     3917
+# cor(condControl,condIntervention)                 0.69      0.21     0.20     0.97 1.00     3450     4615
+# cor(sigma_condControl,sigma_condIntervention)     0.19      0.54    -0.90     0.96 1.00     3862     5486
+# 
+# Regression Coefficients:
+#                        Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# Intercept                  9.50      0.22     9.06     9.92 1.00     4341     6584
+# condIntervention           0.94      0.31     0.34     1.54 1.00     7743     7492
+# sigma_condControl          1.26      0.03     1.21     1.31 1.00    10964     8399
+# sigma_condIntervention     1.30      0.04     1.21     1.38 1.00     7854     7550
+# 
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+chains_ttest_pr <- get_chains(ttest_pr_gaussian_normal)
+
+for (l in 1:length(unique(dat$class))) {
+  name <- paste0("d_s_", l, "")
+  name_control <- paste0("r_class.", l, ".condControl.")
+  name_intervention <- paste0("r_class.", l, ".condIntervention.")
+  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
+  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
+  
+  chains_ttest_pr[[name]] <- sqrt(n - 2) * (chains_ttest_pr$b_condIntervention + chains_ttest_pr[names(chains_ttest_pr) == name_intervention] - chains_ttest_pr[names(chains_ttest_pr) == name_control])/sqrt((n_1 - 1) * (exp(2 * chains_ttest_pr$b_sigma_condControl + 2 * chains_ttest_pr[names(chains_ttest_pr) == name_sigma_control] + 2 * chains_ttest_pr$sd_class__sigma_condControl^2) + chains_ttest_pr$sd_class__condControl^2) + (n_2 - 1) * (exp(2 * chains_ttest_pr$b_sigma_condIntervention + 2 * chains_ttest_pr[names(chains_ttest_pr) == name_sigma_intervention] + 2 * chains_ttest_pr$sd_class__sigma_condIntervention^2) + chains_ttest_pr$sd_class__condIntervention^2))
+}
+
+chains_ttest_pr$d_s_mean <- rowMeans(subset(chains_ttest_pr, select = c(d_s_1:d_s_62)), na.rm = TRUE)
+round(mean(chains_ttest_pr$d_s_mean), 2) #0.25
+bayestestR::hdi(chains_ttest_pr$d_s_mean, ci = 0.95) #95% HDI: [0.10, 0.38]
+chains_ttest_pr$d_s_sd <- apply(subset(chains_ttest_pr, select = c(d_s_1:d_s_62)), 1, sd)
+round(mean(chains_ttest_pr$d_s_sd), 2) #0.25
+bayestestR::hdi(chains_ttest_pr$d_s_sd, ci = 0.95) #95% HDI: [0.10, 0.42]
+```
+
+###Skew-Normal Distribution
+####Flat Priors
+```{r}
+ttest_pr_skew_flat <- brm(bf(
+  pre ~ cond + (0 + cond|class),
+  sigma ~ 0 + cond + (0 + cond|class)),
+  family = skew_normal(),
+  data = dat,
+  warmup = 2500,
+  iter = 5000,
+  cores = parallel::detectCores(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  seed = 0
+)
+
+plot(ttest_pr_skew_flat)
+
+#Grouped pp-Checks
+#Dense Overlay
+pp_check(ttest_pr_skew_flat, ndraws = 100, type = "dens_overlay_grouped", group = "cond")
+pp_check(ttest_pr_skew_flat, ndraws = 100, type = "dens_overlay_grouped", group = "class")
+
+#Residual Error
+pp_check(ttest_pr_skew_flat, type = "error_scatter_avg_grouped", group = "cond")
+pp_check(ttest_pr_skew_flat, type = "error_scatter_avg_grouped", group = "class")
+
+#PIT-ECDF
+pp_check(ttest_pr_skew_flat, ndraws = 100, type = "pit_ecdf_grouped", group = "cond")
+pp_check(ttest_pr_skew_flat, ndraws = 100, type = "pit_ecdf_grouped", group = "class")
+
+summary(ttest_pr_skew_flat, prob = 0.95)
+#  Family: skew_normal 
+#   Links: mu = identity; sigma = log 
+# Formula: pre ~ cond + (0 + cond | class) 
+#          sigma ~ 0 + cond + (0 + cond | class)
+#    Data: dat (Number of observations: 1377) 
+#   Draws: 4 chains, each with iter = 5000; warmup = 2500; thin = 1;
+#          total post-warmup draws = 10000
+# 
+# Multilevel Hyperparameters:
+# ~class (Number of levels: 62) 
+#                                               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(condControl)                                   1.26      0.19     0.92     1.68 1.00     4211     6690
+# sd(condIntervention)                              1.27      0.29     0.75     1.89 1.00     5155     5466
+# sd(sigma_condControl)                             0.05      0.03     0.00     0.12 1.00     3925     4202
+# sd(sigma_condIntervention)                        0.08      0.05     0.00     0.20 1.00     3370     4539
+# cor(condControl,condIntervention)                 0.67      0.21     0.17     0.97 1.00     3156     3921
+# cor(sigma_condControl,sigma_condIntervention)     0.12      0.56    -0.92     0.96 1.00     5226     6465
+# 
+# Regression Coefficients:
+#                        Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# Intercept                  9.50      0.21     9.08     9.93 1.00     4446     5834
+# condIntervention           0.93      0.31     0.30     1.54 1.00     7670     7789
+# sigma_condControl          1.26      0.03     1.21     1.32 1.00    11585     7750
+# sigma_condIntervention     1.30      0.04     1.22     1.38 1.00     9810     6912
+# 
+# Further Distributional Parameters:
+#       Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# alpha     1.38      0.28     0.84     1.88 1.00    11458     5681
+# 
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+chains_ttest_pr <- get_chains(ttest_pr_skew_flat)
+
+for (l in 1:length(unique(dat$class))) {
+  name <- paste0("d_s_", l, "")
+  name_control <- paste0("r_class.", l, ".condControl.")
+  name_intervention <- paste0("r_class.", l, ".condIntervention.")
+  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
+  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
+  
+  chains_ttest_pr[[name]] <- sqrt(n - 2) * (chains_ttest_pr$b_condIntervention + chains_ttest_pr[names(chains_ttest_pr) == name_intervention] - chains_ttest_pr[names(chains_ttest_pr) == name_control])/sqrt((n_1 - 1) * (exp(2 * chains_ttest_pr$b_sigma_condControl + 2 * chains_ttest_pr[names(chains_ttest_pr) == name_sigma_control] + 2 * chains_ttest_pr$sd_class__sigma_condControl^2) + chains_ttest_pr$sd_class__condControl^2) + (n_2 - 1) * (exp(2 * chains_ttest_pr$b_sigma_condIntervention + 2 * chains_ttest_pr[names(chains_ttest_pr) == name_sigma_intervention] + 2 * chains_ttest_pr$sd_class__sigma_condIntervention^2) + chains_ttest_pr$sd_class__condIntervention^2))
+}
+
+chains_ttest_pr$d_s_mean <- rowMeans(subset(chains_ttest_pr, select = c(d_s_1:d_s_62)), na.rm = TRUE)
+round(mean(chains_ttest_pr$d_s_mean), 2) #0.24
+bayestestR::hdi(chains_ttest_pr$d_s_mean, ci = 0.95) #95% HDI: [0.10, 0.39]
+chains_ttest_pr$d_s_sd <- apply(subset(chains_ttest_pr, select = c(d_s_1:d_s_62)), 1, sd)
+round(mean(chains_ttest_pr$d_s_sd), 2) #0.26
+bayestestR::hdi(chains_ttest_pr$d_s_sd, ci = 0.95) #95% HDI: [0.10, 0.42]
+```
+
+####Normal Priors
+```{r}
+ttest_pr_skew_normal <- brm(bf(
+  pre ~ cond + (0 + cond|class),
+  sigma ~ 0 + cond + (0 + cond|class)),
+  family = skew_normal(),
+  data = dat,
+  prior = c(
+    prior(normal(13, 7), class = "b"),
+    prior(normal(1, 2), class = "b", dpar = "sigma")
+  ),
+  warmup = 2500,
+  iter = 5000,
+  cores = parallel::detectCores(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  seed = 0
+)
+
+plot(ttest_pr_skew_normal)
+
+#Grouped pp-Checks
+#Dense Overlay
+pp_check(ttest_pr_skew_normal, ndraws = 100, type = "dens_overlay_grouped", group = "cond")
+pp_check(ttest_pr_skew_normal, ndraws = 100, type = "dens_overlay_grouped", group = "class")
+
+#Residual Error
+pp_check(ttest_pr_skew_normal, type = "error_scatter_avg_grouped", group = "cond")
+pp_check(ttest_pr_skew_normal, type = "error_scatter_avg_grouped", group = "class")
+
+#PIT-ECDF
+pp_check(ttest_pr_skew_normal, ndraws = 100, type = "pit_ecdf_grouped", group = "cond")
+pp_check(ttest_pr_skew_normal, ndraws = 100, type = "pit_ecdf_grouped", group = "class")
+
+summary(ttest_pr_skew_normal, prob = 0.95)
+# Family: skew_normal 
+#   Links: mu = identity; sigma = log 
+# Formula: pre ~ cond + (0 + cond | class) 
+#          sigma ~ 0 + cond + (0 + cond | class)
+#    Data: dat (Number of observations: 1377) 
+#   Draws: 4 chains, each with iter = 5000; warmup = 2500; thin = 1;
+#          total post-warmup draws = 10000
+# 
+# Multilevel Hyperparameters:
+# ~class (Number of levels: 62) 
+#                                               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(condControl)                                   1.26      0.19     0.92     1.67 1.00     4525     6621
+# sd(condIntervention)                              1.26      0.30     0.73     1.89 1.00     5098     5333
+# sd(sigma_condControl)                             0.05      0.03     0.00     0.12 1.00     3795     4499
+# sd(sigma_condIntervention)                        0.08      0.05     0.00     0.20 1.00     3363     5149
+# cor(condControl,condIntervention)                 0.68      0.21     0.16     0.97 1.00     3799     4377
+# cor(sigma_condControl,sigma_condIntervention)     0.13      0.56    -0.91     0.96 1.00     6188     6962
+# 
+# Regression Coefficients:
+#                        Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# Intercept                  9.49      0.22     9.07     9.92 1.00     4972     6894
+# condIntervention           0.96      0.31     0.34     1.57 1.00     9906     8431
+# sigma_condControl          1.26      0.03     1.21     1.32 1.00    13185     7382
+# sigma_condIntervention     1.30      0.04     1.22     1.38 1.00    11215     7364
+# 
+# Further Distributional Parameters:
+#       Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# alpha     1.39      0.27     0.84     1.89 1.00    12501     5751
+# 
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+chains_ttest_pr <- get_chains(ttest_pr_skew_normal)
+
+for (l in 1:length(unique(dat$class))) {
+  name <- paste0("d_s_", l, "")
+  name_control <- paste0("r_class.", l, ".condControl.")
+  name_intervention <- paste0("r_class.", l, ".condIntervention.")
+  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
+  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
+  
+  chains_ttest_pr[[name]] <- sqrt(n - 2) * (chains_ttest_pr$b_condIntervention + chains_ttest_pr[names(chains_ttest_pr) == name_intervention] - chains_ttest_pr[names(chains_ttest_pr) == name_control])/sqrt((n_1 - 1) * (exp(2 * chains_ttest_pr$b_sigma_condControl + 2 * chains_ttest_pr[names(chains_ttest_pr) == name_sigma_control] + 2 * chains_ttest_pr$sd_class__sigma_condControl^2) + chains_ttest_pr$sd_class__condControl^2) + (n_2 - 1) * (exp(2 * chains_ttest_pr$b_sigma_condIntervention + 2 * chains_ttest_pr[names(chains_ttest_pr) == name_sigma_intervention] + 2 * chains_ttest_pr$sd_class__sigma_condIntervention^2) + chains_ttest_pr$sd_class__condIntervention^2))
+}
+
+chains_ttest_pr$d_s_mean <- rowMeans(subset(chains_ttest_pr, select = c(d_s_1:d_s_62)), na.rm = TRUE)
+round(mean(chains_ttest_pr$d_s_mean), 2) #0.25
+bayestestR::hdi(chains_ttest_pr$d_s_mean, ci = 0.95) #95% HDI: [0.11, 0.40]
+chains_ttest_pr$d_s_sd <- apply(subset(chains_ttest_pr, select = c(d_s_1:d_s_62)), 1, sd)
+round(mean(chains_ttest_pr$d_s_sd), 2) #0.25
+bayestestR::hdi(chains_ttest_pr$d_s_sd, ci = 0.95) #[0.10, 0.41]
+```
+
+###Student-t Distribution
+####Flat Priors
+```{r}
+ttest_pr_t_flat <- brm(bf(
+  pre ~ cond + (0 + cond|class),
+  sigma ~ 0 + cond + (0 + cond|class)),
+  family = student(),
+  data = dat,
+  warmup = 2500,
+  iter = 5000,
+  cores = parallel::detectCores(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  seed = 0
+)
+
+plot(ttest_pr_t_flat)
+
+#Grouped pp-Checks
+#Dense Overlay
+pp_check(ttest_pr_t_flat, ndraws = 100, type = "dens_overlay_grouped", group = "cond")
+pp_check(ttest_pr_t_flat, ndraws = 100, type = "dens_overlay_grouped", group = "class")
+
+#Residual Error
+pp_check(ttest_pr_t_flat, type = "error_scatter_avg_grouped", group = "cond")
+pp_check(ttest_pr_t_flat, type = "error_scatter_avg_grouped", group = "class")
+
+#PIT-ECDF
+pp_check(ttest_pr_t_flat, ndraws = 100, type = "pit_ecdf_grouped", group = "cond")
+pp_check(ttest_pr_t_flat, ndraws = 100, type = "pit_ecdf_grouped", group = "class")
+
+summary(ttest_pr_t_flat, prob = 0.95)
+#  Family: student 
+#   Links: mu = identity; sigma = log 
+# Formula: pre ~ cond + (0 + cond | class) 
+#          sigma ~ 0 + cond + (0 + cond | class)
+#    Data: dat (Number of observations: 1377) 
+#   Draws: 4 chains, each with iter = 5000; warmup = 2500; thin = 1;
+#          total post-warmup draws = 10000
+# 
+# Multilevel Hyperparameters:
+# ~class (Number of levels: 62) 
+#                                               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(condControl)                                   1.29      0.20     0.94     1.71 1.00     4305     6208
+# sd(condIntervention)                              1.31      0.29     0.78     1.92 1.00     5639     6205
+# sd(sigma_condControl)                             0.06      0.03     0.00     0.13 1.00     3618     4076
+# sd(sigma_condIntervention)                        0.08      0.06     0.00     0.21 1.00     3366     4526
+# cor(condControl,condIntervention)                 0.70      0.20     0.21     0.98 1.00     3026     3390
+# cor(sigma_condControl,sigma_condIntervention)     0.16      0.55    -0.90     0.96 1.00     5599     6605
+# 
+# Regression Coefficients:
+#                        Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# Intercept                  9.48      0.22     9.05     9.89 1.00     4755     6396
+# condIntervention           0.92      0.32     0.28     1.54 1.00     8519     7722
+# sigma_condControl          1.24      0.03     1.18     1.29 1.00    12478     7680
+# sigma_condIntervention     1.27      0.04     1.19     1.36 1.00     9528     7893
+# 
+# Further Distributional Parameters:
+#    Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# nu    44.02     16.32    20.47    82.93 1.00    15739     7969
+# 
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+chains_ttest_pr <- get_chains(ttest_pr_t_flat)
+
+for (l in 1:length(unique(dat$class))) {
+  name <- paste0("d_s_", l, "")
+  name_control <- paste0("r_class.", l, ".condControl.")
+  name_intervention <- paste0("r_class.", l, ".condIntervention.")
+  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
+  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
+  
+  chains_ttest_pr[[name]] <- sqrt(n - 2) * (chains_ttest_pr$b_condIntervention + chains_ttest_pr[names(chains_ttest_pr) == name_intervention] - chains_ttest_pr[names(chains_ttest_pr) == name_control])/sqrt((n_1 - 1) * (exp(2 * chains_ttest_pr$b_sigma_condControl + 2 * chains_ttest_pr[names(chains_ttest_pr) == name_sigma_control] + 2 * chains_ttest_pr$sd_class__sigma_condControl^2) + chains_ttest_pr$sd_class__condControl^2) + (n_2 - 1) * (exp(2 * chains_ttest_pr$b_sigma_condIntervention + 2 * chains_ttest_pr[names(chains_ttest_pr) == name_sigma_intervention] + 2 * chains_ttest_pr$sd_class__sigma_condIntervention^2) + chains_ttest_pr$sd_class__condIntervention^2))
+}
+
+chains_ttest_pr$d_s_mean <- rowMeans(subset(chains_ttest_pr, select = c(d_s_1:d_s_62)), na.rm = TRUE)
+round(mean(chains_ttest_pr$d_s_mean), 2) #0.24
+bayestestR::hdi(chains_ttest_pr$d_s_mean, ci = 0.95) #95% HDI: [0.10, 0.39]
+chains_ttest_pr$d_s_sd <- apply(subset(chains_ttest_pr, select = c(d_s_1:d_s_62)), 1, sd)
+round(mean(chains_ttest_pr$d_s_sd), 2) #0.26
+bayestestR::hdi(chains_ttest_pr$d_s_sd, ci = 0.95) #95% HDI: [0.08, 0.42]
+```
+
+####Normal Priors
+```{r}
+ttest_pr_t_normal <- brm(bf(
+  pre ~ cond + (0 + cond|class),
+  sigma ~ 0 + cond + (0 + cond|class)),
+  family = student(),
+  data = dat,
+  prior = c(
+    prior(normal(13, 7), class = "b"),
+    prior(normal(1, 2), class = "b", dpar = "sigma")
+  ),
+  warmup = 2500,
+  iter = 5000,
+  cores = parallel::detectCores(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  seed = 0
+)
+
+plot(ttest_pr_t_normal)
+
+#Grouped pp-Checks
+#Dense Overlay
+pp_check(ttest_pr_t_normal, ndraws = 100, type = "dens_overlay_grouped", group = "cond")
+pp_check(ttest_pr_t_normal, ndraws = 100, type = "dens_overlay_grouped", group = "class")
+
+#Residual Error
+pp_check(ttest_pr_t_normal, type = "error_scatter_avg_grouped", group = "cond")
+pp_check(ttest_pr_t_normal, type = "error_scatter_avg_grouped", group = "class")
+
+#PIT-ECDF
+pp_check(ttest_pr_t_normal, ndraws = 100, type = "pit_ecdf_grouped", group = "cond")
+pp_check(ttest_pr_t_normal, ndraws = 100, type = "pit_ecdf_grouped", group = "class")
+
+summary(ttest_pr_t_normal, prob = 0.95)
+#  Family: student 
+#   Links: mu = identity; sigma = log 
+# Formula: pre ~ cond + (0 + cond | class) 
+#          sigma ~ 0 + cond + (0 + cond | class)
+#    Data: dat (Number of observations: 1377) 
+#   Draws: 4 chains, each with iter = 5000; warmup = 2500; thin = 1;
+#          total post-warmup draws = 10000
+# 
+# Multilevel Hyperparameters:
+# ~class (Number of levels: 62) 
+#                                               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(condControl)                                   1.29      0.19     0.94     1.70 1.00     4243     6383
+# sd(condIntervention)                              1.30      0.29     0.78     1.93 1.00     5408     7568
+# sd(sigma_condControl)                             0.05      0.03     0.00     0.13 1.00     3595     4391
+# sd(sigma_condIntervention)                        0.09      0.06     0.00     0.21 1.00     3667     5529
+# cor(condControl,condIntervention)                 0.69      0.21     0.19     0.98 1.00     3339     4142
+# cor(sigma_condControl,sigma_condIntervention)     0.13      0.56    -0.92     0.96 1.00     5306     6699
+# 
+# Regression Coefficients:
+#                        Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# Intercept                  9.47      0.22     9.05     9.90 1.00     5299     7062
+# condIntervention           0.94      0.31     0.31     1.53 1.00     9783     7907
+# sigma_condControl          1.24      0.03     1.18     1.29 1.00    11361     7234
+# sigma_condIntervention     1.27      0.04     1.19     1.36 1.00    11506     7480
+# 
+# Further Distributional Parameters:
+#    Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# nu    43.99     16.53    20.15    83.50 1.00    17459     7988
+# 
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+chains_ttest_pr <- get_chains(ttest_pr_t_normal)
+
+for (l in 1:length(unique(dat$class))) {
+  name <- paste0("d_s_", l, "")
+  name_control <- paste0("r_class.", l, ".condControl.")
+  name_intervention <- paste0("r_class.", l, ".condIntervention.")
+  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
+  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
+  
+  chains_ttest_pr[[name]] <- sqrt(n - 2) * (chains_ttest_pr$b_condIntervention + chains_ttest_pr[names(chains_ttest_pr) == name_intervention] - chains_ttest_pr[names(chains_ttest_pr) == name_control])/sqrt((n_1 - 1) * (exp(2 * chains_ttest_pr$b_sigma_condControl + 2 * chains_ttest_pr[names(chains_ttest_pr) == name_sigma_control] + 2 * chains_ttest_pr$sd_class__sigma_condControl^2) + chains_ttest_pr$sd_class__condControl^2) + (n_2 - 1) * (exp(2 * chains_ttest_pr$b_sigma_condIntervention + 2 * chains_ttest_pr[names(chains_ttest_pr) == name_sigma_intervention] + 2 * chains_ttest_pr$sd_class__sigma_condIntervention^2) + chains_ttest_pr$sd_class__condIntervention^2))
+}
+
+chains_ttest_pr$d_s_mean <- rowMeans(subset(chains_ttest_pr, select = c(d_s_1:d_s_62)), na.rm = TRUE)
+round(mean(chains_ttest_pr$d_s_mean), 2) #0.25
+bayestestR::hdi(chains_ttest_pr$d_s_mean, ci = 0.95) #95% HDI: [0.11, 0.40]
+chains_ttest_pr$d_s_sd <- apply(subset(chains_ttest_pr, select = c(d_s_1:d_s_62)), 1, sd)
+round(mean(chains_ttest_pr$d_s_sd), 2) #0.26
+bayestestR::hdi(chains_ttest_pr$d_s_sd, ci = 0.95) #95% HDI: [0.09, 0.42]
+```
+
+###Simulation Study
+####Monte-Carlo Run
+```{r}
+library(doFuture)
+library(doRNG)
+library(progressr)
+
+load("data/estimates_d_s.RObject")
+
+#Global Simulation Settings
+set.seed(0)
+doFuture::registerDoFuture()
+plan(multisession, workers = 4)
+progressr::handlers(global = TRUE)
+n_rep <- 500
+
+n_cl <- 62          # Number of unique classes (groups)
+size_cl <- 22        # Number of observations per class
+n_tot <- n_cl * size_cl
+n_0 <- 930
+n_1 <- 434
+
+mu <- 9.52
+sd_mu <- 1.32
+
+kappa <- 0.87
+sd_kappa <- 1.14
+
+sigma_0 <- 1.26
+sd_sigma_0 <- 0.06
+
+sigma_1 <- 1.30
+sd_sigma_1 <- 0.09
+
+d_s_exact <- sqrt(n_0 + n_1 - 2) * kappa/sqrt((n_0 - 1) * exp(2 * sigma_0) + (n_1 - 1) * exp(2 * sigma_1)) #0.2435608
+
+d_s_cl_exact <- sqrt(n_0 + n_1 - 2) * kappa/sqrt((n_0 - 1) * (exp(2 * sigma_0 + 2 * sd_sigma_0^2) + sd_mu^2) + (n_1 - 1) * (exp(2 * sigma_1 + 2 * sd_sigma_1^2) + sd_kappa^2)) #0.2285399
+
+loop <- function(r){
+  class_effects <- data.frame(
+    class = factor(1:n_cl),
+    u0 = rnorm(n_cl, mean = 0, sd = sd_mu),
+    u1 = rnorm(n_cl, mean = 0, sd = sd_kappa),
+    v0 = rnorm(n_cl, mean = 0, sd = sd_sigma_0),
+    v1 = rnorm(n_cl, mean = 0, sd = sd_sigma_1)
+  )
+
+  sim_data <- data.frame(
+    class = factor(rep(1:n_cl, each = size_cl)),
+    cond  = rep(c(rep(0, times = 15), rep(1, times = 7)), times = n_cl)
+  ) %>%
+    left_join(class_effects, by = "class") %>%
+   mutate(
+      # Compute true Mu and Sigma for each observation
+      mu_i    = mu + kappa * cond + u0 * (1 - cond) + u1 * cond,
+      sigma_i = exp(sigma_0 * (1 - cond) + sigma_1 * cond + v0 * (1 - cond) + v1 * cond),
+      # Sample the outcome variable
+      y       = rnorm(n_tot, mean = mu_i, sd = sigma_i)
+    )
+  
+    sim_data <- sim_data %>% mutate(
+      y = ifelse(y > 26, 26, ifelse(y < 0, 0, y)),
+      cond = as.factor(cond)
+    )
+
+   fit_d_s <- brm(bf(
+        y ~ cond,
+        sigma ~ 0 + cond),
+      family = gaussian(),
+      data = sim_data ,
+      warmup = 2500 , 
+      iter = 5000 , 
+      cores = parallel::detectCores (),
+      control = list(adapt_delta = 0.99 , max_treedepth = 15),
+      backend = "cmdstanr",
+      stan_model_args = list(stanc_options = list("O1")),
+      seed = 0,
+      normalize = FALSE
+    )
+    
+    sum_d_s <- summary(fit_d_s, prob = 0.95)
+  
+    d_s <- sqrt(n_0 + n_1 - 2) * sum_d_s$fixed$Estimate[2]/sqrt((n_0 - 1) * exp(2 * sum_d_s$fixed$Estimate[3]) + (n_1 - 1) * exp(2 * sum_d_s$fixed$Estimate[4]))
+
+    fit_d_s_cl <- brm(bf(
+        y ~ cond + (0 + cond||class),
+        sigma ~ 0 + cond + (0 + cond||class)),
+      family = gaussian(),
+      data =  sim_data,
+      warmup = 2500 , 
+      iter = 5000 , 
+      cores = parallel::detectCores (),
+      control = list(adapt_delta = 0.99 , max_treedepth = 15),
+      backend = "cmdstanr",
+      stan_model_args = list(stanc_options = list("O1")),
+      seed = 0,
+      normalize = FALSE
+    )
+    
+    sum_d_s <- summary(fit_d_s_cl, prob = 0.95)
+  
+    d_s_cl <- sqrt(n_0 + n_1 - 2) * sum_d_s$fixed$Estimate[2]/sqrt((n_0 - 1) * (exp(2 * sum_d_s$fixed$Estimate[3] + 2 * sum_d_s$random$class$Estimate[3]^2) + sum_d_s$random$class$Estimate[1]^2) + (n_1 - 1) * (exp(2 * sum_d_s$fixed$Estimate[4] + 2 * sum_d_s$random$class$Estimate[4]^2) + sum_d_s$random$class$Estimate[2]^2))
+    
+    
+    sim_data <- sim_data %>% mutate(y = y/26)
+
+    fit_d_s_ZOIB <- brm(bf(
+      y ~ 0 + cond,
+      phi ~ 0 + cond),
+      family = zero_one_inflated_beta(),
+      data = sim_data,
+      warmup = 2500, 
+      iter = 5000, 
+      cores = parallel::detectCores (),
+      control = list(adapt_delta = 0.99 , max_treedepth = 15),
+      backend = "cmdstanr",
+      stan_model_args = list(stanc_options = list("O1")),
+      seed = 0,
+      normalize = FALSE
+  )
+        
+    sum_d_s_ZOIB <- summary(fit_d_s_ZOIB, prob = 0.95)
+    
+    mu_0 <- invlogit(sum_d_s_ZOIB$fixed$Estimate[1])
+    mu_1 <- invlogit(sum_d_s_ZOIB$fixed$Estimate[2])
+    
+    sigma_0 <- sqrt((mu_0 * (1 - mu_0))/(exp(sum_d_s_ZOIB$fixed$Estimate[3]) + 1))
+    sigma_1 <- sqrt((mu_1 * (1 - mu_1))/(exp(sum_d_s_ZOIB$fixed$Estimate[4]) + 1))
+    
+    d_s_ZOIB <- sqrt(n_0 + n_1 - 2) * (invlogit(sum_d_s_ZOIB$fixed$Estimate[2]) - invlogit(sum_d_s_ZOIB$fixed$Estimate[1]))/sqrt((n_0 - 1) * sigma_0^2 + (n_1 - 1) * sigma_1^2)
+    
+  p(message = sprintf("%d", r))
+  return(data.frame(r = r, d_s = d_s, d_s_cl = d_s_cl, d_s_ZOIB = d_s_ZOIB))
+}
+
+with_progress({
+  p <- progressor(steps = n_rep)
+  estimates_d_s <- foreach(r = 1:n_rep, .combine = 'rbind', .packages = "progressr") %dorng% loop(r)
+})
+
+save(estimates_d_s, file = "estimates_d_s.RObject")
+```
+
+####Results
+```{r}
+bias(estimates_d_s$d_s, d_s_exact) #-4.394
+mse(estimates_d_s$d_s, d_s_exact) #11.617
+mcse(estimates_d_s$d_s, d_s_exact) #1.5
+
+bias(estimates_d_s$d_s_cl, d_s_cl_exact) #1.585
+mse(estimates_d_s$d_s_cl, d_s_cl_exact) #13.025
+mcse(estimates_d_s$d_s_cl, d_s_cl_exact) #1.6
+
+bias(estimates_d_s$d_s_ZOIB, d_s_exact) #-6.548
+mse(estimates_d_s$d_s_ZOIB, d_s_exact) #11.441
+mcse(estimates_d_s$d_s_ZOIB, d_s_exact) #1.5
+```
+
+###Zero-One-Inflated Beta
+####Flat Priors
+```{r}
+dat <- dat %>% mutate(
+  sr_pre = pre/26,
+  sr_post = post/26
+)
+
+ ttest_pr_ZOIB_flat <- brm(bf(
+      sr_pre ~ 0 + cond,
+      phi ~ 0 + cond),
+      family = zero_one_inflated_beta(),
+    data = dat,
+    warmup = 2500,
+    iter = 5000,
+    cores = parallel::detectCores(),
+    control = list(adapt_delta = 0.95, max_treedepth = 15),
+    seed = 0
+  )
+        
+plot(ttest_po_ZOIB_flat)
+
+#Grouped pp-Checks
+#Dense Overlay
+pp_check(ttest_pr_ZOIB_flat, ndraws = 100, type = "dens_overlay_grouped", group = "cond")
+
+#Residual Error
+pp_check(ttest_pr_ZOIB_flat, type = "error_scatter_avg_grouped", group = "cond")
+
+#PIT-ECDF
+pp_check(ttest_pr_ZOIB_flat, ndraws = 100, type = "pit_ecdf_grouped", group = "cond")
+
+summary(ttest_pr_ZOIB_flat, prob = 0.95)
+#  Family: zero_one_inflated_beta 
+#   Links: mu = logit; phi = log; zoi = identity; coi = identity 
+# Formula: sr_pre ~ 0 + cond 
+#          phi ~ 0 + cond
+#    Data: dat (Number of observations: 1377) 
+#   Draws: 4 chains, each with iter = 5000; warmup = 2500; thin = 1;
+#          total post-warmup draws = 10000
+# 
+# Regression Coefficients:
+#                      Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# condControl             -0.53      0.02    -0.57    -0.49 1.00    10677     7356
+# condIntervention        -0.35      0.03    -0.41    -0.29 1.00     9018     7207
+# phi_condControl          2.31      0.04     2.22     2.39 1.00    11667     8142
+# phi_condIntervention     2.28      0.07     2.15     2.40 1.00     9926     7881
+# 
+# Further Distributional Parameters:
+#     Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# zoi     0.00      0.00     0.00     0.00 1.00     9734     5799
+# coi     0.50      0.29     0.03     0.98 1.00    10860     5826
+# 
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+chains_ttest_pr <- get_chains(ttest_pr_ZOIB_flat)
+
+mu_0 <- sapply(chains_ttest_pr$b_condControl, invlogit)
+mu_1 <- sapply(chains_ttest_pr$b_condIntervention, invlogit)
+  
+sigma_0 <- mapply(sigma_ZOIB, mu_0, unlist(chains_ttest_pr$b_phi_condControl))
+sigma_1 <-  mapply(sigma_ZOIB, mu_1, unlist(chains_ttest_pr$b_phi_condIntervention))
+  
+chains_ttest_pr$d_s <- sqrt(n - 2) * (mu_1 - mu_0)/sqrt((n_1 - 1) * sigma_0^2 + (n_2 - 1) * sigma_1^2)
+
+round(mean(chains_ttest_pr$d_s), 2) #0.29
+bayestestR::hdi(chains_ttest_pr$d_s, ci = 0.95) #95% HDI: [0.17, 0.40]
+```
+
+####Normal Priors
+```{r}
+ ttest_pr_ZOIB_normal <- brm(bf(
+      sr_pre ~ 0 + cond,
+      phi ~ 0 + cond),
+      family = zero_one_inflated_beta(),
+    data = dat,
+    prior = c(
+      prior(normal(0, 1), class = "b"),
+      prior(normal(1, 2), class = "b", dpar = "phi")
+    ),
+    warmup = 2500,
+    iter = 5000,
+    cores = parallel::detectCores(),
+    control = list(adapt_delta = 0.95, max_treedepth = 15),
+    seed = 0
+  )
+        
+plot(ttest_pr_ZOIB_normal)
+
+#Grouped pp-Checks
+#Dense Overlay
+pp_check(ttest_pr_ZOIB_normal, ndraws = 100, type = "dens_overlay_grouped", group = "cond")
+
+#Residual Error
+pp_check(ttest_pr_ZOIB_normal, type = "error_scatter_avg_grouped", group = "cond")
+
+#PIT-ECDF
+pp_check(ttest_pr_ZOIB_normal, ndraws = 100, type = "pit_ecdf_grouped", group = "cond")
+
+summary(ttest_pr_ZOIB_normal, prob = 0.95)
+#  Family: zero_one_inflated_beta 
+#   Links: mu = logit; phi = log; zoi = identity; coi = identity 
+# Formula: sr_pre ~ 0 + cond 
+#          phi ~ 0 + cond
+#    Data: dat (Number of observations: 1377) 
+#   Draws: 4 chains, each with iter = 5000; warmup = 2500; thin = 1;
+#          total post-warmup draws = 10000
+# 
+# Regression Coefficients:
+#                      Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# condControl             -0.53      0.02    -0.57    -0.49 1.00    10677     7356
+# condIntervention        -0.35      0.03    -0.41    -0.29 1.00     9018     7207
+# phi_condControl          2.31      0.04     2.22     2.39 1.00    11667     8142
+# phi_condIntervention     2.28      0.07     2.15     2.40 1.00     9926     7881
+# 
+# Further Distributional Parameters:
+#     Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# zoi     0.00      0.00     0.00     0.00 1.00     9734     5799
+# coi     0.50      0.29     0.03     0.98 1.00    10860     5826
+# 
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+chains_ttest_pr <- get_chains(ttest_pr_ZOIB_normal)
+
+mu_0 <- sapply(chains_ttest_pr$b_condControl, invlogit)
+mu_1 <- sapply(chains_ttest_pr$b_condIntervention, invlogit)
+  
+sigma_0 <- mapply(sigma_ZOIB, mu_0, unlist(chains_ttest_pr$b_phi_condControl))
+sigma_1 <-  mapply(sigma_ZOIB, mu_1, unlist(chains_ttest_pr$b_phi_condIntervention))
+  
+chains_ttest_pr$d_s <- sqrt(n - 2) * (mu_1 - mu_0)/sqrt((n_1 - 1) * sigma_0^2 + (n_2 - 1) * sigma_1^2)
+
+round(mean(chains_ttest_pr$d_s), 2) #0.29
+bayestestR::hdi(chains_ttest_pr$d_s, ci = 0.95) #95% HDI: [0.17, 0.40]
+```
+
+##Posttest
+```{r}
+cohens_d(intervention$post, control$post, pooled_sd = FALSE, paired = FALSE, ci = 0.95)
+# Cohen's d |       95% CI
+# ------------------------
+# 0.20      | [0.08, 0.31]
+
+cohens_d_cl_po <- data.frame(cl = 1:62, d_s = numeric(62))
+
+for (l in 1:62) {
+  intervention_cl <- intervention %>% filter(class == l)
+  control_cl <- control %>% filter(class == l)
+  cohens_d_cl_po$d_s[l] <- as.numeric(cohens_d(intervention_cl$post, control_cl$post, pooled_sd = FALSE, paired = FALSE, ci = 0.95))[1]
+}  
+
+mean(cohens_d_cl_po$d_s, na.rm = TRUE)
+```
+
+###Gaussian Distribution
+####Flat Priors
+```{r}
+ttest_po_gaussian_flat <- brm(bf(
+  post ~ cond + (0 + cond|class),
+  sigma ~ 0 + cond + (0 + cond|class)),
+  family = gaussian(),
+  data = dat,
+  warmup = 2500,
+  iter = 5000,
+  cores = parallel::detectCores(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  seed = 0
+)
+
+plot(ttest_po_gaussian_flat)
+
+#Grouped pp-Checks
+#Dense Overlay
+pp_check(ttest_po_gaussian_flat, ndraws = 100, type = "dens_overlay_grouped", group = "cond")
+pp_check(ttest_po_gaussian_flat, ndraws = 100, type = "dens_overlay_grouped", group = "class")
+
+#Residual Error
+pp_check(ttest_po_gaussian_flat, type = "error_scatter_avg_grouped", group = "cond")
+pp_check(ttest_po_gaussian_flat, type = "error_scatter_avg_grouped", group = "class")
+
+#PIT-ECDF
+pp_check(ttest_po_gaussian_flat, ndraws = 100, type = "pit_ecdf_grouped", group = "cond")
+pp_check(ttest_po_gaussian_flat, ndraws = 100, type = "pit_ecdf_grouped", group = "class")
+
+summary(ttest_po_gaussian_flat, prob = 0.95)
+#  Family: gaussian 
+#   Links: mu = identity; sigma = log 
+# Formula: post ~ cond + (0 + cond | class) 
+#          sigma ~ 0 + cond + (0 + cond | class)
+#    Data: dat (Number of observations: 1377) 
+#   Draws: 4 chains, each with iter = 5000; warmup = 2500; thin = 1;
+#          total post-warmup draws = 10000
+# 
+# Multilevel Hyperparameters:
+# ~class (Number of levels: 62) 
+#                                               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(condControl)                                   2.33      0.29     1.80     2.95 1.00     2855     5213
+# sd(condIntervention)                              2.00      0.37     1.35     2.79 1.00     4718     6717
+# sd(sigma_condControl)                             0.09      0.04     0.01     0.17 1.00     2509     2846
+# sd(sigma_condIntervention)                        0.08      0.06     0.00     0.22 1.00     2832     4613
+# cor(condControl,condIntervention)                 0.68      0.19     0.21     0.96 1.00     2398     3693
+# cor(sigma_condControl,sigma_condIntervention)    -0.13      0.57    -0.96     0.92 1.00     4507     5100
+# 
+# Regression Coefficients:
+#                        Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# Intercept                 15.32      0.35    14.62    15.99 1.00     2430     4127
+# condIntervention           1.10      0.43     0.26     1.96 1.00     5108     5711
+# sigma_condControl          1.44      0.03     1.38     1.49 1.00     6773     7752
+# sigma_condIntervention     1.47      0.04     1.38     1.55 1.00     8296     6502
+# 
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+chains_ttest_po <- get_chains(ttest_po_gaussian_flat)
+
+for (l in 1:length(unique(dat$class))) {
+  name <- paste0("d_s_", l, "")
+  name_control <- paste0("r_class.", l, ".condControl.")
+  name_intervention <- paste0("r_class.", l, ".condIntervention.")
+  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
+  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
+  
+  chains_ttest_po[[name]] <- sqrt(n - 2) * (chains_ttest_po$b_condIntervention + chains_ttest_po[names(chains_ttest_po) == name_intervention] - chains_ttest_po[names(chains_ttest_po) == name_control])/sqrt((n_1 - 1) * (exp(2 * chains_ttest_po$b_sigma_condControl + 2 * chains_ttest_po[names(chains_ttest_po) == name_sigma_control] + 2 * chains_ttest_po$sd_class__sigma_condControl^2) + chains_ttest_po$sd_class__condControl^2) + (n_2 - 1) * (exp(2 * chains_ttest_po$b_sigma_condIntervention + 2 * chains_ttest_po[names(chains_ttest_po) == name_sigma_intervention] + 2 * chains_ttest_po$sd_class__sigma_condIntervention^2) + chains_ttest_po$sd_class__condIntervention^2))
+}
+
+chains_ttest_po$d_s_mean <- rowMeans(subset(chains_ttest_po, select = c(d_s_1:d_s_62)), na.rm = TRUE)
+d_s_po <- round(mean(chains_ttest_po$d_s_mean), 2) #0.23
+bayestestR::hdi(chains_ttest_po$d_s_mean, ci = 0.95) #95% HDI: [0.08, 0.38]
+chains_ttest_po$d_s_sd <- apply(subset(chains_ttest_po, select = c(d_s_1:d_s_62)), 1, sd)
+d_s_sd_po <- round(mean(chains_ttest_po$d_s_sd), 2) #0.34
+bayestestR::hdi(chains_ttest_po$d_s_sd, ci = 0.95) #95% HDI: [0.15, 0.54]
+
+#Histogram
+random <- data.frame(
+  cl = rep(1:62, 2),
+  d_s = c(
+    colMeans(subset(chains_ttest_pr, select = c(d_s_1:d_s_62)), na.rm = TRUE),
+    colMeans(subset(chains_ttest_po, select = c(d_s_1:d_s_62)), na.rm = TRUE)
+  ),
+  Time = c(rep("Pretest", 62), rep("Posttest", 62)),
+  mean = c(rep(d_s_pr, 62), rep(d_s_po, 62)),
+  low = c(rep(d_s_pr - d_s_sd_pr, 62), rep(d_s_po - d_s_sd_po, 62)),
+  high = c(rep(d_s_pr + d_s_sd_pr, 62), rep(d_s_po + d_s_sd_po, 62))
+)
+
+random <- random %>% mutate(Time = as.factor(Time))
+random <- random %>% mutate(Time = fct_relevel(Time, "Pretest", "Posttest"))
+  
+random %>% ggplot(aes(x = d_s)) + geom_histogram(bins = 70, color = "black", alpha = 0.3, linewidth = .1) + ylab("Frequency") + theme_classic(base_size = size) + scale_x_continuous(breaks = pretty(random$d_s, n = 6)) + xlab(TeX("Cohen's $d_s$ for each Class via Partial Pooling")) + geom_vline(aes(xintercept = mean), linetype="dashed", linewidth = 1) + geom_segment(data = random, aes(x = low, xend = high, y = 0, yend = 0), inherit.aes = FALSE, colour = "black", linewidth = 2.5)+ facet_wrap(~Time) + scale_fill_grey() + scale_color_grey() + labs(color='') 
+
+#Learning per class
+random %>% ggplot(aes(x = Time, y = d_s, group = cl)) + geom_point(alpha = 0.3) + geom_path(alpha = 0.3) + scale_fill_grey() + scale_color_grey() + labs(color='') + xlab("Time") + ylab(TeX("Cohen's $d_s$ ")) + scale_y_continuous(breaks = pretty(random$d_s, n = 5)) + theme_classic(base_size = size)
+```
+
+####Normal Priors
+```{r}
+ttest_po_gaussian_normal <- brm(bf(
+  post ~ cond + (0 + cond|class),
+  sigma ~ 0 + cond + (0 + cond|class)),
+  family = gaussian(),
+  prior = c(
+    prior(normal(13, 7), class = "b"),
+    prior(normal(1, 2), class = "b", dpar = "sigma")
+  ),
+  data = dat,
+  warmup = 2500,
+  iter = 5000,
+  cores = parallel::detectCores(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  seed = 0
+)
+
+plot(ttest_po_gaussian_normal)
+
+#Grouped pp-Checks
+#Dense Overlay
+pp_check(ttest_po_gaussian_normal, ndraws = 100, type = "dens_overlay_grouped", group = "cond")
+pp_check(ttest_po_gaussian_normal, ndraws = 100, type = "dens_overlay_grouped", group = "class")
+
+#Residual Error
+pp_check(ttest_po_gaussian_normal, type = "error_scatter_avg_grouped", group = "cond")
+pp_check(ttest_po_gaussian_normal, type = "error_scatter_avg_grouped", group = "class")
+
+#PIT-ECDF
+pp_check(ttest_po_gaussian_normal, ndraws = 100, type = "pit_ecdf_grouped", group = "cond")
+pp_check(ttest_po_gaussian_normal, ndraws = 100, type = "pit_ecdf_grouped", group = "class")
+
+summary(ttest_po_gaussian_normal, prob = 0.95)
+# Family: gaussian 
+#   Links: mu = identity; sigma = log 
+# Formula: post ~ cond + (0 + cond | class) 
+#          sigma ~ 0 + cond + (0 + cond | class)
+#    Data: dat (Number of observations: 1377) 
+#   Draws: 4 chains, each with iter = 5000; warmup = 2500; thin = 1;
+#          total post-warmup draws = 10000
+# 
+# Multilevel Hyperparameters:
+# ~class (Number of levels: 62) 
+#                                               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(condControl)                                   2.32      0.29     1.80     2.95 1.00     3078     5009
+# sd(condIntervention)                              1.99      0.38     1.34     2.80 1.00     4696     6698
+# sd(sigma_condControl)                             0.09      0.04     0.01     0.17 1.00     2338     1754
+# sd(sigma_condIntervention)                        0.08      0.06     0.00     0.22 1.00     3021     5136
+# cor(condControl,condIntervention)                 0.68      0.20     0.22     0.96 1.00     2613     4056
+# cor(sigma_condControl,sigma_condIntervention)    -0.13      0.57    -0.97     0.93 1.00     5012     5925
+# 
+# Regression Coefficients:
+#                        Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# Intercept                 15.30      0.35    14.62    15.97 1.00     2440     4488
+# condIntervention           1.15      0.43     0.30     2.00 1.00     6217     7075
+# sigma_condControl          1.44      0.03     1.38     1.49 1.00     8786     7683
+# sigma_condIntervention     1.47      0.04     1.38     1.54 1.00     7641     7312
+# 
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+chains_ttest_po <- get_chains(ttest_po_gaussian_normal)
+
+for (l in 1:length(unique(dat$class))) {
+  name <- paste0("d_s_", l, "")
+  name_control <- paste0("r_class.", l, ".condControl.")
+  name_intervention <- paste0("r_class.", l, ".condIntervention.")
+  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
+  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
+  
+  chains_ttest_po[[name]] <- sqrt(n - 2) * (chains_ttest_po$b_condIntervention + chains_ttest_po[names(chains_ttest_po) == name_intervention] - chains_ttest_po[names(chains_ttest_po) == name_control])/sqrt((n_1 - 1) * (exp(2 * chains_ttest_po$b_sigma_condControl + 2 * chains_ttest_po[names(chains_ttest_po) == name_sigma_control] + 2 * chains_ttest_po$sd_class__sigma_condControl^2) + chains_ttest_po$sd_class__condControl^2) + (n_2 - 1) * (exp(2 * chains_ttest_po$b_sigma_condIntervention + 2 * chains_ttest_po[names(chains_ttest_po) == name_sigma_intervention] + 2 * chains_ttest_po$sd_class__sigma_condIntervention^2) + chains_ttest_po$sd_class__condIntervention^2))
+}
+
+chains_ttest_po$d_s_mean <- rowMeans(subset(chains_ttest_po, select = c(d_s_1:d_s_62)), na.rm = TRUE)
+round(mean(chains_ttest_po$d_s_mean), 2) #0.23
+bayestestR::hdi(chains_ttest_po$d_s_mean, ci = 0.95) #95% HDI: [0.09, 0.38]
+chains_ttest_po$d_s_sd <- apply(subset(chains_ttest_po, select = c(d_s_1:d_s_62)), 1, sd)
+round(mean(chains_ttest_po$d_s_sd), 2) #0.34
+bayestestR::hdi(chains_ttest_po$d_s_sd, ci = 0.95) #95% HDI: [0.14, 0.54]
+```
+
+###Skew-Normal Distribution
+####Flat Priors
+```{r}
+ttest_po_skew_flat <- brm(bf(
+  post ~ cond + (0 + cond|class),
+  sigma ~ 0 + cond + (0 + cond|class)),
+  family = skew_normal(),
+  data = dat,
+  warmup = 2500,
+  iter = 5000,
+  cores = parallel::detectCores(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  seed = 0
+)
+
+plot(ttest_po_skew_flat)
+
+#Grouped pp-Checks
+#Dense Overlay
+pp_check(ttest_po_skew_flat, ndraws = 100, type = "dens_overlay_grouped", group = "cond")
+pp_check(ttest_po_skew_flat, ndraws = 100, type = "dens_overlay_grouped", group = "class")
+
+#Residual Error
+pp_check(ttest_po_skew_flat, type = "error_scatter_avg_grouped", group = "cond")
+pp_check(ttest_po_skew_flat, type = "error_scatter_avg_grouped", group = "class")
+
+#PIT-ECDF
+pp_check(ttest_po_skew_flat, ndraws = 100, type = "pit_ecdf_grouped", group = "cond")
+pp_check(ttest_po_skew_flat, ndraws = 100, type = "pit_ecdf_grouped", group = "class")
+
+summary(ttest_po_skew_flat, prob = 0.95)
+# Family: skew_normal 
+#   Links: mu = identity; sigma = log 
+# Formula: post ~ cond + (0 + cond | class) 
+#          sigma ~ 0 + cond + (0 + cond | class)
+#    Data: dat (Number of observations: 1377) 
+#   Draws: 4 chains, each with iter = 5000; warmup = 2500; thin = 1;
+#          total post-warmup draws = 10000
+# 
+# Multilevel Hyperparameters:
+# ~class (Number of levels: 62) 
+#                                               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(condControl)                                   2.28      0.29     1.76     2.90 1.00     3049     5270
+# sd(condIntervention)                              1.93      0.36     1.31     2.70 1.00     4889     7410
+# sd(sigma_condControl)                             0.10      0.04     0.02     0.18 1.00     2228     2857
+# sd(sigma_condIntervention)                        0.08      0.06     0.00     0.22 1.00     2836     4406
+# cor(condControl,condIntervention)                 0.65      0.21     0.15     0.96 1.00     2581     3352
+# cor(sigma_condControl,sigma_condIntervention)    -0.10      0.57    -0.96     0.93 1.00     4887     6410
+# 
+# Regression Coefficients:
+#                        Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# Intercept                 15.32      0.34    14.65    15.99 1.00     2461     4801
+# condIntervention           1.11      0.43     0.26     1.98 1.00     5612     7173
+# sigma_condControl          1.45      0.03     1.39     1.51 1.00     8864     7565
+# sigma_condIntervention     1.46      0.04     1.37     1.54 1.00     9161     7220
+# 
+# Further Distributional Parameters:
+#       Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# alpha    -1.75      0.28    -2.32    -1.21 1.00    10617     7199
+# 
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+chains_ttest_po <- get_chains(ttest_po_skew_flat)
+
+for (l in 1:length(unique(dat$class))) {
+  name <- paste0("d_s_", l, "")
+  name_control <- paste0("r_class.", l, ".condControl.")
+  name_intervention <- paste0("r_class.", l, ".condIntervention.")
+  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
+  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
+  
+  chains_ttest_po[[name]] <- sqrt(n - 2) * (chains_ttest_po$b_condIntervention + chains_ttest_po[names(chains_ttest_po) == name_intervention] - chains_ttest_po[names(chains_ttest_po) == name_control])/sqrt((n_1 - 1) * (exp(2 * chains_ttest_po$b_sigma_condControl + 2 * chains_ttest_po[names(chains_ttest_po) == name_sigma_control] + 2 * chains_ttest_po$sd_class__sigma_condControl^2) + chains_ttest_po$sd_class__condControl^2) + (n_2 - 1) * (exp(2 * chains_ttest_po$b_sigma_condIntervention + 2 * chains_ttest_po[names(chains_ttest_po) == name_sigma_intervention] + 2 * chains_ttest_po$sd_class__sigma_condIntervention^2) + chains_ttest_po$sd_class__condIntervention^2))
+}
+
+chains_ttest_po$d_s_mean <- rowMeans(subset(chains_ttest_po, select = c(d_s_1:d_s_62)), na.rm = TRUE)
+round(mean(chains_ttest_po$d_s_mean), 2) #0.23
+bayestestR::hdi(chains_ttest_po$d_s_mean, ci = 0.95) #95% HDI: [0.07, 0.37]
+chains_ttest_po$d_s_sd <- apply(subset(chains_ttest_po, select = c(d_s_1:d_s_62)), 1, sd)
+round(mean(chains_ttest_po$d_s_sd), 2) #0.35
+bayestestR::hdi(chains_ttest_po$d_s_sd, ci = 0.95) #95% HDI: [0.14, 0.55]
+```
+
+####Normal Priors
+```{r}
+ttest_po_skew_normal <- brm(bf(
+  post ~ cond + (0 + cond|class),
+  sigma ~ 0 + cond + (0 + cond|class)),
+  family = skew_normal(),
+  data = dat,
+  prior = c(
+    prior(normal(13, 7), class = "b"),
+    prior(normal(1, 2), class = "b", dpar = "sigma")
+  ),
+  warmup = 2500,
+  iter = 5000,
+  cores = parallel::detectCores(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  seed = 0
+)
+
+plot(ttest_po_skew_normal)
+
+#Grouped pp-Checks
+#Dense Overlay
+pp_check(ttest_po_skew_normal, ndraws = 100, type = "dens_overlay_grouped", group = "cond")
+pp_check(ttest_po_skew_normal, ndraws = 100, type = "dens_overlay_grouped", group = "class")
+
+#Residual Error
+pp_check(ttest_po_skew_normal, type = "error_scatter_avg_grouped", group = "cond")
+pp_check(ttest_po_skew_normal, type = "error_scatter_avg_grouped", group = "class")
+
+#PIT-ECDF
+pp_check(ttest_po_skew_normal, ndraws = 100, type = "pit_ecdf_grouped", group = "cond")
+pp_check(ttest_po_skew_normal, ndraws = 100, type = "pit_ecdf_grouped", group = "class")
+
+summary(ttest_po_skew_normal, prob = 0.95)
+#  Family: skew_normal 
+#   Links: mu = identity; sigma = log 
+# Formula: post ~ cond + (0 + cond | class) 
+#          sigma ~ 0 + cond + (0 + cond | class)
+#    Data: dat (Number of observations: 1377) 
+#   Draws: 4 chains, each with iter = 5000; warmup = 2500; thin = 1;
+#          total post-warmup draws = 10000
+# 
+# Multilevel Hyperparameters:
+# ~class (Number of levels: 62) 
+#                                               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(condControl)                                   2.28      0.29     1.76     2.91 1.00     2910     5072
+# sd(condIntervention)                              1.92      0.37     1.30     2.72 1.00     3793     6102
+# sd(sigma_condControl)                             0.10      0.04     0.01     0.18 1.00     2192     1493
+# sd(sigma_condIntervention)                        0.08      0.06     0.00     0.21 1.00     2839     4751
+# cor(condControl,condIntervention)                 0.65      0.21     0.15     0.96 1.00     1903     3455
+# cor(sigma_condControl,sigma_condIntervention)    -0.12      0.57    -0.96     0.93 1.00     4468     5750
+# 
+# Regression Coefficients:
+#                        Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# Intercept                 15.32      0.34    14.63    15.98 1.00     2285     3412
+# condIntervention           1.14      0.43     0.31     2.01 1.00     4450     6163
+# sigma_condControl          1.45      0.03     1.39     1.51 1.00     7508     7307
+# sigma_condIntervention     1.46      0.04     1.37     1.54 1.00     7234     6469
+# 
+# Further Distributional Parameters:
+#       Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# alpha    -1.74      0.29    -2.33    -1.20 1.00    10422     7387
+# 
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+chains_ttest_po <- get_chains(ttest_po_skew_normal)
+
+for (l in 1:length(unique(dat$class))) {
+  name <- paste0("d_s_", l, "")
+  name_control <- paste0("r_class.", l, ".condControl.")
+  name_intervention <- paste0("r_class.", l, ".condIntervention.")
+  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
+  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
+  
+  chains_ttest_po[[name]] <- sqrt(n - 2) * (chains_ttest_po$b_condIntervention + chains_ttest_po[names(chains_ttest_po) == name_intervention] - chains_ttest_po[names(chains_ttest_po) == name_control])/sqrt((n_1 - 1) * (exp(2 * chains_ttest_po$b_sigma_condControl + 2 * chains_ttest_po[names(chains_ttest_po) == name_sigma_control] + 2 * chains_ttest_po$sd_class__sigma_condControl^2) + chains_ttest_po$sd_class__condControl^2) + (n_2 - 1) * (exp(2 * chains_ttest_po$b_sigma_condIntervention + 2 * chains_ttest_po[names(chains_ttest_po) == name_sigma_intervention] + 2 * chains_ttest_po$sd_class__sigma_condIntervention^2) + chains_ttest_po$sd_class__condIntervention^2))
+}
+
+chains_ttest_po$d_s_mean <- rowMeans(subset(chains_ttest_po, select = c(d_s_1:d_s_62)), na.rm = TRUE)
+round(mean(chains_ttest_po$d_s_mean), 2) #0.23
+bayestestR::hdi(chains_ttest_po$d_s_mean, ci = 0.95) #95% HDI: [0.09, 0.38]
+chains_ttest_po$d_s_sd <- apply(subset(chains_ttest_po, select = c(d_s_1:d_s_62)), 1, sd)
+round(mean(chains_ttest_po$d_s_sd), 2) #0.35
+bayestestR::hdi(chains_ttest_po$d_s_sd, ci = 0.95) #95% HDI: [0.14, 0.54]
+```
+
+###Student-t Distribution
+####Flat Priors
+```{r}
+ttest_po_t_flat <- brm(bf(
+  post ~ cond + (0 + cond|class),
+  sigma ~ 0 + cond + (0 + cond|class)),
+  family = student(),
+  data = dat,
+  warmup = 2500,
+  iter = 5000,
+  cores = parallel::detectCores(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  seed = 0
+)
+
+plot(ttest_po_t_flat)
+
+#Grouped pp-Checks
+#Dense Overlay
+pp_check(ttest_po_t_flat, ndraws = 100, type = "dens_overlay_grouped", group = "cond")
+pp_check(ttest_po_t_flat, ndraws = 100, type = "dens_overlay_grouped", group = "class")
+
+#Residual Error
+pp_check(ttest_po_t_flat, type = "error_scatter_avg_grouped", group = "cond")
+pp_check(ttest_po_t_flat, type = "error_scatter_avg_grouped", group = "class")
+
+#PIT-ECDF
+pp_check(ttest_po_t_flat, ndraws = 100, type = "pit_ecdf_grouped", group = "cond")
+pp_check(ttest_po_t_flat, ndraws = 100, type = "pit_ecdf_grouped", group = "class")
+
+summary(ttest_po_t_flat, prob = 0.95)
+#  Family: student 
+#   Links: mu = identity; sigma = log 
+# Formula: post ~ cond + (0 + cond | class) 
+#          sigma ~ 0 + cond + (0 + cond | class)
+#    Data: dat (Number of observations: 1377) 
+#   Draws: 4 chains, each with iter = 5000; warmup = 2500; thin = 1;
+#          total post-warmup draws = 10000
+# 
+# Multilevel Hyperparameters:
+# ~class (Number of levels: 62) 
+#                                               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(condControl)                                   2.34      0.29     1.82     2.97 1.00     3015     5862
+# sd(condIntervention)                              2.04      0.38     1.37     2.85 1.00     4517     6772
+# sd(sigma_condControl)                             0.09      0.04     0.01     0.17 1.00     2363     2282
+# sd(sigma_condIntervention)                        0.08      0.06     0.00     0.21 1.00     3029     4059
+# cor(condControl,condIntervention)                 0.68      0.20     0.23     0.96 1.00     2317     3116
+# cor(sigma_condControl,sigma_condIntervention)    -0.09      0.58    -0.97     0.94 1.00     5372     6344
+# 
+# Regression Coefficients:
+#                        Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# Intercept                 15.35      0.35    14.64    16.02 1.00     2414     4359
+# condIntervention           1.12      0.44     0.29     1.97 1.00     5734     7079
+# sigma_condControl          1.41      0.03     1.35     1.47 1.00     8420     7784
+# sigma_condIntervention     1.44      0.04     1.35     1.52 1.00     9025     6890
+# 
+# Further Distributional Parameters:
+#    Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# nu    42.87     16.07    19.90    81.60 1.00    14213     7703
+# 
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+chains_ttest_po <- get_chains(ttest_po_t_flat)
+
+for (l in 1:length(unique(dat$class))) {
+  name <- paste0("d_s_", l, "")
+  name_control <- paste0("r_class.", l, ".condControl.")
+  name_intervention <- paste0("r_class.", l, ".condIntervention.")
+  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
+  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
+  
+  chains_ttest_po[[name]] <- sqrt(n - 2) * (chains_ttest_po$b_condIntervention + chains_ttest_po[names(chains_ttest_po) == name_intervention] - chains_ttest_po[names(chains_ttest_po) == name_control])/sqrt((n_1 - 1) * (exp(2 * chains_ttest_po$b_sigma_condControl + 2 * chains_ttest_po[names(chains_ttest_po) == name_sigma_control] + 2 * chains_ttest_po$sd_class__sigma_condControl^2) + chains_ttest_po$sd_class__condControl^2) + (n_2 - 1) * (exp(2 * chains_ttest_po$b_sigma_condIntervention + 2 * chains_ttest_po[names(chains_ttest_po) == name_sigma_intervention] + 2 * chains_ttest_po$sd_class__sigma_condIntervention^2) + chains_ttest_po$sd_class__condIntervention^2))
+}
+
+chains_ttest_po$d_s_mean <- rowMeans(subset(chains_ttest_po, select = c(d_s_1:d_s_62)), na.rm = TRUE)
+round(mean(chains_ttest_po$d_s_mean), 2) #0.24
+bayestestR::hdi(chains_ttest_po$d_s_mean, ci = 0.95) #95% HDI: [0.08, 0.39]
+chains_ttest_po$d_s_sd <- apply(subset(chains_ttest_po, select = c(d_s_1:d_s_62)), 1, sd)
+round(mean(chains_ttest_po$d_s_sd), 2) #0.35
+bayestestR::hdi(chains_ttest_po$d_s_sd, ci = 0.95) #95% HDI: [0.15, 0.56]
+```
+
+####Normal Priors
+```{r}
+ttest_po_t_normal <- brm(bf(
+  post ~ cond + (0 + cond|class),
+  sigma ~ 0 + cond + (0 + cond|class)),
+  family = student(),
+  data = dat,
+  prior = c(
+    prior(normal(13, 7), class = "b"),
+    prior(normal(1, 2), class = "b", dpar = "sigma")
+  ),
+  warmup = 2500,
+  iter = 5000,
+  cores = parallel::detectCores(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  seed = 0
+)
+
+plot(ttest_po_t_normal)
+
+#Grouped pp-Checks
+#Dense Overlay
+pp_check(ttest_po_t_normal, ndraws = 100, type = "dens_overlay_grouped", group = "cond")
+pp_check(ttest_po_t_normal, ndraws = 100, type = "dens_overlay_grouped", group = "class")
+
+#Residual Error
+pp_check(ttest_po_t_normal, type = "error_scatter_avg_grouped", group = "cond")
+pp_check(ttest_po_t_normal, type = "error_scatter_avg_grouped", group = "class")
+
+#PIT-ECDF
+pp_check(ttest_po_t_normal, ndraws = 100, type = "pit_ecdf_grouped", group = "cond")
+pp_check(ttest_po_t_normal, ndraws = 100, type = "pit_ecdf_grouped", group = "class")
+
+summary(ttest_po_t_normal, prob = 0.95)
+#  Family: student 
+#   Links: mu = identity; sigma = log 
+# Formula: post ~ cond + (0 + cond | class) 
+#          sigma ~ 0 + cond + (0 + cond | class)
+#    Data: dat (Number of observations: 1377) 
+#   Draws: 4 chains, each with iter = 5000; warmup = 2500; thin = 1;
+#          total post-warmup draws = 10000
+# 
+# Multilevel Hyperparameters:
+# ~class (Number of levels: 62) 
+#                                               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(condControl)                                   2.34      0.30     1.82     2.98 1.00     2764     5102
+# sd(condIntervention)                              2.04      0.38     1.38     2.88 1.00     4161     6918
+# sd(sigma_condControl)                             0.08      0.04     0.01     0.17 1.00     2173     2023
+# sd(sigma_condIntervention)                        0.08      0.06     0.00     0.21 1.00     3244     4454
+# cor(condControl,condIntervention)                 0.67      0.20     0.21     0.96 1.00     2430     3354
+# cor(sigma_condControl,sigma_condIntervention)    -0.10      0.57    -0.96     0.93 1.00     5739     6751
+# 
+# Regression Coefficients:
+#                        Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# Intercept                 15.31      0.36    14.61    16.01 1.00     2031     3783
+# condIntervention           1.19      0.44     0.35     2.06 1.00     5172     5987
+# sigma_condControl          1.41      0.03     1.35     1.47 1.00     7917     7267
+# sigma_condIntervention     1.44      0.04     1.35     1.52 1.00     8371     7046
+# 
+# Further Distributional Parameters:
+#    Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# nu    42.76     16.71    19.13    82.90 1.00    14329     7944
+# 
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+chains_ttest_po <- get_chains(ttest_po_t_normal)
+
+for (l in 1:length(unique(dat$class))) {
+  name <- paste0("d_s_", l, "")
+  name_control <- paste0("r_class.", l, ".condControl.")
+  name_intervention <- paste0("r_class.", l, ".condIntervention.")
+  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
+  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
+  
+  chains_ttest_po[[name]] <- sqrt(n - 2) * (chains_ttest_po$b_condIntervention + chains_ttest_po[names(chains_ttest_po) == name_intervention] - chains_ttest_po[names(chains_ttest_po) == name_control])/sqrt((n_1 - 1) * (exp(2 * chains_ttest_po$b_sigma_condControl + 2 * chains_ttest_po[names(chains_ttest_po) == name_sigma_control] + 2 * chains_ttest_po$sd_class__sigma_condControl^2) + chains_ttest_po$sd_class__condControl^2) + (n_2 - 1) * (exp(2 * chains_ttest_po$b_sigma_condIntervention + 2 * chains_ttest_po[names(chains_ttest_po) == name_sigma_intervention] + 2 * chains_ttest_po$sd_class__sigma_condIntervention^2) + chains_ttest_po$sd_class__condIntervention^2))
+}
+
+chains_ttest_po$d_s_mean <- rowMeans(subset(chains_ttest_po, select = c(d_s_1:d_s_62)), na.rm = TRUE)
+round(mean(chains_ttest_po$d_s_mean), 2) #0.24
+bayestestR::hdi(chains_ttest_po$d_s_mean, ci = 0.95) #95% HDI: [0.09, 0.39]
+chains_ttest_po$d_s_sd <- apply(subset(chains_ttest_po, select = c(d_s_1:d_s_62)), 1, sd)
+round(mean(chains_ttest_po$d_s_sd), 2) #0.36
+bayestestR::hdi(chains_ttest_po$d_s_sd, ci = 0.95) #95% HDI: [0.14, 0.56]
+```
+
+###Zero-One-Inflated Beta
+####Flat Priors
+```{r}
+ ttest_po_ZOIB_flat <- brm(bf(
+      sr_post ~ 0 + cond,
+      phi ~ 0 + cond),
+      family = zero_one_inflated_beta(),
+    data = dat,
+    warmup = 2500,
+    iter = 5000,
+    cores = parallel::detectCores(),
+    control = list(adapt_delta = 0.95, max_treedepth = 15),
+    seed = 0
+  )
+        
+plot(ttest_po_ZOIB_flat)
+
+#Grouped pp-Checks
+#Dense Overlay
+pp_check(ttest_po_ZOIB_flat, ndraws = 100, type = "dens_overlay_grouped", group = "cond")
+
+#Residual Error
+pp_check(ttest_po_ZOIB_flat, type = "error_scatter_avg_grouped", group = "cond")
+
+#PIT-ECDF
+pp_check(ttest_po_ZOIB_flat, ndraws = 100, type = "pit_ecdf_grouped", group = "cond")
+
+summary(ttest_po_ZOIB_flat, prob = 0.95)
+#  Family: zero_one_inflated_beta 
+#   Links: mu = logit; phi = log; zoi = identity; coi = identity 
+# Formula: sr_post ~ 0 + cond 
+#          phi ~ 0 + cond
+#    Data: dat (Number of observations: 1377) 
+#   Draws: 4 chains, each with iter = 5000; warmup = 2500; thin = 1;
+#          total post-warmup draws = 10000
+# 
+# Regression Coefficients:
+#                      Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# condControl              0.40      0.02     0.35     0.44 1.00    12178     7722
+# condIntervention         0.54      0.04     0.47     0.61 1.00    12415     7552
+# phi_condControl          1.86      0.04     1.77     1.94 1.00    13349     7305
+# phi_condIntervention     1.81      0.06     1.68     1.93 1.00    11625     7726
+# 
+# Further Distributional Parameters:
+#     Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# zoi     0.01      0.00     0.00     0.01 1.00    12383     6961
+# coi     0.92      0.08     0.72     1.00 1.00    10930     5094
+# 
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+chains_ttest_po <- get_chains(ttest_po_ZOIB_flat)
+
+mu_0 <- sapply(chains_ttest_po$b_condControl, invlogit)
+mu_1 <- sapply(chains_ttest_po$b_condIntervention, invlogit)
+  
+sigma_0 <- mapply(sigma_ZOIB, mu_0, unlist(chains_ttest_po$b_phi_condControl))
+sigma_1 <-  mapply(sigma_ZOIB, mu_1, unlist(chains_ttest_po$b_phi_condIntervention))
+  
+chains_ttest_po$d_s <- sqrt(n - 2) * (mu_1 - mu_0)/sqrt((n_1 - 1) * sigma_0^2 + (n_2 - 1) * sigma_1^2)
+
+round(mean(chains_ttest_po$d_s), 2) #0.19
+bayestestR::hdi(chains_ttest_po$d_s, ci = 0.95) #95% HDI: [0.08, 0.31]
+```
+
+####Normal Priors
+```{r}
+ ttest_po_ZOIB_normal <- brm(bf(
+      sr_post ~ 0 + cond,
+      phi ~ 0 + cond),
+      family = zero_one_inflated_beta(),
+    data = dat,
+    prior = c(
+      prior(normal(0, 1), class = "b"),
+      prior(normal(1, 2), class = "b", dpar = "phi")
+    ),
+    warmup = 2500,
+    iter = 5000,
+    cores = parallel::detectCores(),
+    control = list(adapt_delta = 0.95, max_treedepth = 15),
+    seed = 0
+  )
+        
+plot(ttest_po_ZOIB_normal)
+
+#Grouped pp-Checks
+#Dense Overlay
+pp_check(ttest_po_ZOIB_normal, ndraws = 100, type = "dens_overlay_grouped", group = "cond")
+
+#Residual Error
+pp_check(ttest_po_ZOIB_normal, type = "error_scatter_avg_grouped", group = "cond")
+
+#PIT-ECDF
+pp_check(ttest_po_ZOIB_normal, ndraws = 100, type = "pit_ecdf_grouped", group = "cond")
+
+summary(ttest_po_ZOIB_normal, prob = 0.95)
+#  Family: zero_one_inflated_beta 
+#   Links: mu = logit; phi = log; zoi = identity; coi = identity 
+# Formula: sr_post ~ 0 + cond 
+#          phi ~ 0 + cond
+#    Data: dat (Number of observations: 1377) 
+#   Draws: 4 chains, each with iter = 5000; warmup = 2500; thin = 1;
+#          total post-warmup draws = 10000
+# 
+# Regression Coefficients:
+#                      Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# condControl              0.40      0.02     0.35     0.44 1.00    14094     7886
+# condIntervention         0.54      0.04     0.47     0.62 1.00    13414     7680
+# phi_condControl          1.86      0.04     1.77     1.94 1.00    14001     7435
+# phi_condIntervention     1.81      0.06     1.68     1.93 1.00    13106     7679
+# 
+# Further Distributional Parameters:
+#     Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# zoi     0.01      0.00     0.00     0.01 1.00    14372     6963
+# coi     0.92      0.08     0.72     1.00 1.00    11312     5366
+# 
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+chains_ttest_po <- get_chains(ttest_po_ZOIB_normal)
+
+mu_0 <- sapply(chains_ttest_po$b_condControl, invlogit)
+mu_1 <- sapply(chains_ttest_po$b_condIntervention, invlogit)
+  
+sigma_0 <- mapply(sigma_ZOIB, mu_0, unlist(chains_ttest_po$b_phi_condControl))
+sigma_1 <-  mapply(sigma_ZOIB, mu_1, unlist(chains_ttest_po$b_phi_condIntervention))
+  
+chains_ttest_po$d_s <- sqrt(n - 2) * (mu_1 - mu_0)/sqrt((n_1 - 1) * sigma_0^2 + (n_2 - 1) * sigma_1^2)
+
+round(mean(chains_ttest_po$d_s), 2) #0.19
+bayestestR::hdi(chains_ttest_po$d_s, ci = 0.95) #95% HDI: [0.08, 0.30]
+```
+
+#Within-Group Design
+```{r}
+cor(control$pre, control$post)#0.3445877
+cor(intervention$pre, intervention$post)#0.4047585
+
+repeated_measures_d(Pair(post, pre) ~ 1, data = dat %>% filter(cond == "Control"), method = "z", adjust = FALSE, ci = 0.95)
+# d (z) |       95% CI
+# --------------------
+# 1.21  | [1.13, 1.30]
+
+repeated_measures_d(Pair(post, pre) ~ 1, data = dat %>% filter(cond == "Intervention"), method = "z", adjust = FALSE, ci = 0.95)
+# d (z) |       95% CI
+# --------------------
+# 1.23  | [1.10, 1.35]
+```
+
+##Gaussian Distribution
+###Flat Priors
+```{r}
+gain_gaussian_flat <- brm(bf(
+  post - pre ~ 0 + cond + (0 + cond|class),
+  sigma ~ 0 + cond + (0 + cond|class)),
+  family = gaussian(),
+  data = dat,
+  warmup = 2500,
+  iter = 5000,
+  cores = parallel::detectCores(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  seed = 0
+)
+
+plot(gain_gaussian_flat)
+
+#Grouped pp-Checks
+#Dense Overlay
+pp_check(gain_gaussian_flat, ndraws = 100, type = "dens_overlay_grouped", group = "cond")
+pp_check(gain_gaussian_flat, ndraws = 100, type = "dens_overlay_grouped", group = "class")
+
+#Residual Error
+pp_check(gain_gaussian_flat, type = "error_scatter_avg_grouped", group = "cond")
+pp_check(gain_gaussian_flat, type = "error_scatter_avg_grouped", group = "class")
+
+#PIT-ECDF
+pp_check(gain_gaussian_flat, ndraws = 100, type = "pit_ecdf_grouped", group = "cond")
+pp_check(gain_gaussian_flat, ndraws = 100, type = "pit_ecdf_grouped", group = "class")
+
+summary(gain_gaussian_flat, prob = 0.95)
+#  Family: gaussian 
+#   Links: mu = identity; sigma = log 
+# Formula: post - pre ~ 0 + cond + (0 + cond | class) 
+#          sigma ~ 0 + cond + (0 + cond | class)
+#    Data: dat (Number of observations: 1377) 
+#   Draws: 4 chains, each with iter = 5000; warmup = 2500; thin = 1;
+#          total post-warmup draws = 10000
+# 
+# Multilevel Hyperparameters:
+# ~class (Number of levels: 62) 
+#                                               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(condControl)                                   2.38      0.28     1.88     2.98 1.00     3739     5683
+# sd(condIntervention)                              2.00      0.37     1.35     2.81 1.00     5235     7272
+# sd(sigma_condControl)                             0.08      0.04     0.00     0.16 1.00     2452     3364
+# sd(sigma_condIntervention)                        0.07      0.05     0.00     0.18 1.00     3557     4201
+# cor(condControl,condIntervention)                 0.72      0.20     0.25     0.98 1.00     2206     3596
+# cor(sigma_condControl,sigma_condIntervention)    -0.11      0.56    -0.96     0.93 1.00     5706     6083
+# 
+# Regression Coefficients:
+#                        Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# condControl                5.84      0.36     5.14     6.54 1.00     2260     3828
+# condIntervention           6.02      0.41     5.23     6.85 1.00     4853     6589
+# sigma_condControl          1.47      0.03     1.41     1.52 1.00     9391     8025
+# sigma_condIntervention     1.47      0.04     1.39     1.55 1.00     8762     6815
+# 
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+chains_gain <- get_chains(gain_gaussian_flat)
+
+for (l in 1:length(unique(dat$class))) {
+  name <- paste0("d_z_", l, "_control")
+  name_control <- paste0("r_class.", l, ".condControl.")
+  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
+  
+  chains_gain[[name]] <- (chains_gain$b_condControl + chains_gain[names(chains_gain) == name_control])/sqrt(exp(2 * chains_gain$b_sigma_condControl + 2 * chains_gain[names(chains_gain) == name_sigma_control] + 2 * chains_gain$sd_class__sigma_condControl^2) + chains_gain$sd_class__condControl^2)
+}
+
+for (l in 1:length(unique(dat$class))) {
+  name <- paste0("d_z_", l, "_intervention")
+  name_intervention <- paste0("r_class.", l, ".condIntervention.")
+  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
+  
+  chains_gain[[name]] <- (chains_gain$b_condIntervention + chains_gain[names(chains_gain) == name_intervention])/sqrt(exp(2 * chains_gain$b_sigma_condIntervention + 2 * chains_gain[names(chains_gain) == name_sigma_intervention] + 2 * chains_gain$sd_class__sigma_condIntervention^2) + chains_gain$sd_class__condIntervention^2)
+}
+
+#Control Condition
+chains_gain$d_z_mean<- rowMeans(subset(chains_gain, select = c(d_z_1_control:d_z_62_control)), na.rm = TRUE)
+d_z_control <- round(mean(chains_gain$d_z_mean), 2) #1.17
+bayestestR::hdi(chains_gain$d_z_mean, ci = 0.95) #95% HDI: [1.07, 1.28]
+chains_gain$d_z_sd <- apply(subset(chains_gain, select = c(d_z_1_control:d_z_62_control)), 1, sd)
+d_z_sd_control <- round(mean(chains_gain$d_z_sd), 2) #0.48
+bayestestR::hdi(chains_gain$d_z_sd, ci = 0.95) #95% HDI: [0.42, 0.55]
+
+#Intervention Condition
+chains_gain$d_z_mean<- rowMeans(subset(chains_gain, select = c(d_z_1_intervention:d_z_62_intervention)), na.rm = TRUE)
+d_z_intervention <- round(mean(chains_gain$d_z_mean), 2) #1.25
+bayestestR::hdi(chains_gain$d_z_mean, ci = 0.95) #95% HDI: [1.08, 1.41]
+chains_gain$d_z_sd <- apply(subset(chains_gain, select = c(d_z_1_intervention:d_z_62_intervention)), 1, sd)
+d_z_sd_intervention <- round(mean(chains_gain$d_z_sd), 2) #0.42
+bayestestR::hdi(chains_gain$d_z_sd, ci = 0.95) #95% HDI: [0.31, 0.54]
+
+#Histogram
+random <- data.frame(
+  cl = rep(1:62, 2),
+  d_z = c(
+    colMeans(subset(chains_gain, select = c(d_z_1_control:d_z_62_control)), na.rm = TRUE),
+    colMeans(subset(chains_gain, select = c(d_z_1_intervention:d_z_62_intervention)), na.rm = TRUE)
+  ),
+  Condition = c(rep("Control", 62), rep("Intervention", 62)),
+  mean = c(rep(d_z_control, 62), rep(d_z_intervention, 62)),
+  low = c(rep(d_z_control - d_z_sd_control, 62), rep(d_z_intervention - d_z_sd_intervention, 62)),
+  high = c(rep(d_z_control + d_z_sd_control, 62), rep(d_z_intervention + d_z_sd_intervention, 62))
+)
+
+random <- random %>% mutate(Condition = as.factor(Condition))
+random <- random %>% mutate(Condition = fct_relevel(Condition, "Control", "Intervention"))
+  
+random %>% ggplot(aes(x = d_z)) + geom_histogram(bins = 70, color = "black", alpha = 0.3, linewidth = .1) + ylab("Frequency") + theme_classic(base_size = size) + scale_x_continuous(breaks = pretty(random$d_z, n = 8)) + xlab(TeX("Cohen's $d_z$ for each Class via Partial Pooling")) + geom_vline(aes(xintercept = mean), linetype="dashed", linewidth = 1) + geom_segment(data = random, aes(x = low, xend = high, y = 0, yend = 0), inherit.aes = FALSE, colour = "black", linewidth = 2.5) + facet_wrap(~Condition) + scale_fill_grey() + scale_color_grey() + labs(color='') 
+
+#Learning per class
+random %>% ggplot(aes(x = Condition, y = d_z, group = cl)) + geom_point(alpha = 0.3) + geom_path(alpha = 0.3, linetype = "dashed") + scale_fill_grey() + scale_color_grey() + labs(color='') + xlab("Condition") + ylab(TeX("Cohen's $d_z$ ")) + theme_classic(base_size = size)
+```
+
+###Normal Priors
+```{r}
+gain_gaussian_normal <- brm(bf(
+  post - pre ~ 0 + cond + (0 + cond|class),
+  sigma ~ 0 + cond + (0 + cond|class)),
+  family = gaussian(),
+  data = dat,
+  prior = c(
+    prior(normal(6, 3), class = "b"),
+    prior(normal(1, 2), class = "b", dpar = "sigma")
+  ),
+  warmup = 2500,
+  iter = 5000,
+  cores = parallel::detectCores(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  seed = 0
+)
+
+plot(gain_gaussian_normal)
+
+#Grouped pp-Checks
+#Dense Overlay
+pp_check(gain_gaussian_normal, ndraws = 100, type = "dens_overlay_grouped", group = "cond")
+pp_check(gain_gaussian_normal, ndraws = 100, type = "dens_overlay_grouped", group = "class")
+
+#Residual Error
+pp_check(gain_gaussian_normal, type = "error_scatter_avg_grouped", group = "cond")
+pp_check(gain_gaussian_normal, type = "error_scatter_avg_grouped", group = "class")
+
+#PIT-ECDF
+pp_check(gain_gaussian_normal, ndraws = 100, type = "pit_ecdf_grouped", group = "cond")
+pp_check(gain_gaussian_normal, ndraws = 100, type = "pit_ecdf_grouped", group = "class")
+
+summary(gain_gaussian_normal, prob = 0.95)
+#  Family: gaussian 
+#   Links: mu = identity; sigma = log 
+# Formula: post - pre ~ 0 + cond + (0 + cond | class) 
+#          sigma ~ 0 + cond + (0 + cond | class)
+#    Data: dat (Number of observations: 1377) 
+#   Draws: 4 chains, each with iter = 5000; warmup = 2500; thin = 1;
+#          total post-warmup draws = 10000
+# 
+# Multilevel Hyperparameters:
+# ~class (Number of levels: 62) 
+#                                               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(condControl)                                   2.39      0.29     1.88     2.99 1.00     3421     5951
+# sd(condIntervention)                              2.02      0.37     1.35     2.82 1.00     4884     6865
+# sd(sigma_condControl)                             0.08      0.04     0.01     0.17 1.00     2220     3321
+# sd(sigma_condIntervention)                        0.07      0.05     0.00     0.18 1.00     3498     4236
+# cor(condControl,condIntervention)                 0.71      0.20     0.22     0.98 1.00     2007     2620
+# cor(sigma_condControl,sigma_condIntervention)    -0.10      0.57    -0.96     0.93 1.00     5923     6060
+# 
+# Regression Coefficients:
+#                        Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# condControl                5.84      0.35     5.16     6.54 1.00     2049     3732
+# condIntervention           6.03      0.40     5.25     6.83 1.00     3962     6381
+# sigma_condControl          1.47      0.03     1.41     1.52 1.00     8430     7533
+# sigma_condIntervention     1.47      0.04     1.39     1.55 1.00     9138     7035
+# 
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+chains_gain <- get_chains(gain_gaussian_normal)
+
+for (l in 1:length(unique(dat$class))) {
+  name <- paste0("d_z_", l, "_control")
+  name_control <- paste0("r_class.", l, ".condControl.")
+  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
+  
+  chains_gain[[name]] <- (chains_gain$b_condControl + chains_gain[names(chains_gain) == name_control])/sqrt(exp(2 * chains_gain$b_sigma_condControl + 2 * chains_gain[names(chains_gain) == name_sigma_control] + 2 * chains_gain$sd_class__sigma_condControl^2) + chains_gain$sd_class__condControl^2)
+}
+
+for (l in 1:length(unique(dat$class))) {
+  name <- paste0("d_z_", l, "_intervention")
+  name_intervention <- paste0("r_class.", l, ".condIntervention.")
+  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
+  
+  chains_gain[[name]] <- (chains_gain$b_condIntervention + chains_gain[names(chains_gain) == name_intervention])/sqrt(exp(2 * chains_gain$b_sigma_condIntervention + 2 * chains_gain[names(chains_gain) == name_sigma_intervention] + 2 * chains_gain$sd_class__sigma_condIntervention^2) + chains_gain$sd_class__condIntervention^2)
+}
+
+#Control Condition
+chains_gain$d_z_mean<- rowMeans(subset(chains_gain, select = c(d_z_1_control:d_z_62_control)), na.rm = TRUE)
+round(mean(chains_gain$d_z_mean), 2) #1.17
+bayestestR::hdi(chains_gain$d_z_mean, ci = 0.95) #95% HDI: [1.06, 1.28]
+chains_gain$d_z_sd <- apply(subset(chains_gain, select = c(d_z_1_control:d_z_62_control)), 1, sd)
+round(mean(chains_gain$d_z_sd), 2) #0.48
+bayestestR::hdi(chains_gain$d_z_sd, ci = 0.95) #95% HDI: [0.41, 0.55]
+
+#Intervention Condition
+chains_gain$d_z_mean<- rowMeans(subset(chains_gain, select = c(d_z_1_intervention:d_z_62_intervention)), na.rm = TRUE)
+round(mean(chains_gain$d_z_mean), 2) #1.25
+bayestestR::hdi(chains_gain$d_z_mean, ci = 0.95) #95% HDI: [1.08, 1.42]
+chains_gain$d_z_sd <- apply(subset(chains_gain, select = c(d_z_1_intervention:d_z_62_intervention)), 1, sd)
+round(mean(chains_gain$d_z_sd), 2) #0.42
+bayestestR::hdi(chains_gain$d_z_sd, ci = 0.95) #95% HDI: [0.30, 0.53]
+```
+
+##Skew-Normal Distribution
+###Flat Priors
+```{r}
+gain_skew_flat <- brm(bf(
+  post - pre ~ 0 + cond + (0 + cond|class),
+  sigma ~ 0 + cond + (0 + cond|class)),
+  family = skew_normal(),
+  data = dat,
+  warmup = 2500,
+  iter = 5000,
+  cores = parallel::detectCores(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  seed = 0
+)
+
+plot(gain_skew_flat)
+
+#Grouped pp-Checks
+#Dense Overlay
+pp_check(gain_skew_flat, ndraws = 100, type = "dens_overlay_grouped", group = "cond")
+pp_check(gain_skew_flat, ndraws = 100, type = "dens_overlay_grouped", group = "class")
+
+#Residual Error
+pp_check(gain_skew_flat, type = "error_scatter_avg_grouped", group = "cond")
+pp_check(gain_skew_flat, type = "error_scatter_avg_grouped", group = "class")
+
+#PIT-ECDF
+pp_check(gain_skew_flat, ndraws = 100, type = "pit_ecdf_grouped", group = "cond")
+pp_check(gain_skew_flat, ndraws = 100, type = "pit_ecdf_grouped", group = "class")
+
+summary(gain_skew_flat, prob = 0.95)
+#  Family: skew_normal 
+#   Links: mu = identity; sigma = log 
+# Formula: post - pre ~ 0 + cond + (0 + cond | class) 
+#          sigma ~ 0 + cond + (0 + cond | class)
+#    Data: dat (Number of observations: 1377) 
+#   Draws: 4 chains, each with iter = 5000; warmup = 2500; thin = 1;
+#          total post-warmup draws = 10000
+# 
+# Multilevel Hyperparameters:
+# ~class (Number of levels: 62) 
+#                                               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(condControl)                                   2.39      0.28     1.88     2.98 1.00     3431     5342
+# sd(condIntervention)                              2.00      0.36     1.35     2.79 1.00     4987     6823
+# sd(sigma_condControl)                             0.08      0.04     0.01     0.17 1.00     2346     3558
+# sd(sigma_condIntervention)                        0.07      0.05     0.00     0.18 1.00     3596     4617
+# cor(condControl,condIntervention)                 0.71      0.20     0.23     0.98 1.00     2072     3038
+# cor(sigma_condControl,sigma_condIntervention)    -0.10      0.57    -0.96     0.93 1.00     5669     6029
+# 
+# Regression Coefficients:
+#                        Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# condControl                5.83      0.36     5.13     6.55 1.00     2275     3604
+# condIntervention           6.02      0.41     5.22     6.85 1.00     3558     5236
+# sigma_condControl          1.47      0.03     1.41     1.52 1.00     7030     7161
+# sigma_condIntervention     1.48      0.04     1.39     1.55 1.00     9052     6517
+# 
+# Further Distributional Parameters:
+#       Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# alpha    -0.21      0.51    -1.07     0.74 1.00    11076     8789
+# 
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+chains_gain <- get_chains(gain_skew_flat)
+
+for (l in 1:length(unique(dat$class))) {
+  name <- paste0("d_z_", l, "_control")
+  name_control <- paste0("r_class.", l, ".condControl.")
+  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
+  
+  chains_gain[[name]] <- (chains_gain$b_condControl + chains_gain[names(chains_gain) == name_control])/sqrt(exp(2 * chains_gain$b_sigma_condControl + 2 * chains_gain[names(chains_gain) == name_sigma_control] + 2 * chains_gain$sd_class__sigma_condControl^2) + chains_gain$sd_class__condControl^2)
+}
+
+for (l in 1:length(unique(dat$class))) {
+  name <- paste0("d_z_", l, "_intervention")
+  name_intervention <- paste0("r_class.", l, ".condIntervention.")
+  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
+  
+  chains_gain[[name]] <- (chains_gain$b_condIntervention + chains_gain[names(chains_gain) == name_intervention])/sqrt(exp(2 * chains_gain$b_sigma_condIntervention + 2 * chains_gain[names(chains_gain) == name_sigma_intervention] + 2 * chains_gain$sd_class__sigma_condIntervention^2) + chains_gain$sd_class__condIntervention^2)
+}
+
+#Control Condition
+chains_gain$d_z_mean<- rowMeans(subset(chains_gain, select = c(d_z_1_control:d_z_62_control)), na.rm = TRUE)
+round(mean(chains_gain$d_z_mean), 2) #1.17
+bayestestR::hdi(chains_gain$d_z_mean, ci = 0.95) #95% HDI: [1.06, 1.27]
+chains_gain$d_z_sd <- apply(subset(chains_gain, select = c(d_z_1_control:d_z_62_control)), 1, sd)
+round(mean(chains_gain$d_z_sd), 2) #0.48
+bayestestR::hdi(chains_gain$d_z_sd, ci = 0.95) #95% HDI: [0.42, 0.55]
+
+#Intervention Condition
+chains_gain$d_z_mean<- rowMeans(subset(chains_gain, select = c(d_z_1_intervention:d_z_62_intervention)), na.rm = TRUE)
+round(mean(chains_gain$d_z_mean), 2) #1.25
+bayestestR::hdi(chains_gain$d_z_mean, ci = 0.95) #95% HDI: [1.08, 1.42]
+chains_gain$d_z_sd <- apply(subset(chains_gain, select = c(d_z_1_intervention:d_z_62_intervention)), 1, sd)
+round(mean(chains_gain$d_z_sd), 2) #0.42
+bayestestR::hdi(chains_gain$d_z_sd, ci = 0.95) #95% HDI: [0.30, 0.53]
+```
+
+###Normal Priors
+```{r}
+gain_skew_normal <- brm(bf(
+  post - pre ~ 0 + cond + (0 + cond|class),
+  sigma ~ 0 + cond + (0 + cond|class)),
+  family = skew_normal(),
+  data = dat,
+  prior = c(
+    prior(normal(6, 3), class = "b"),
+    prior(normal(1, 2), class = "b", dpar = "sigma")
+  ),
+  warmup = 2500,
+  iter = 5000,
+  cores = parallel::detectCores(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  seed = 0
+)
+
+plot(gain_skew_normal)
+
+#Grouped pp-Checks
+#Dense Overlay
+pp_check(gain_skew_normal, ndraws = 100, type = "dens_overlay_grouped", group = "cond")
+pp_check(gain_skew_normal, ndraws = 100, type = "dens_overlay_grouped", group = "class")
+
+#Residual Error
+pp_check(gain_skew_normal, type = "error_scatter_avg_grouped", group = "cond")
+pp_check(gain_skew_normal, type = "error_scatter_avg_grouped", group = "class")
+
+#PIT-ECDF
+pp_check(gain_skew_normal, ndraws = 100, type = "pit_ecdf_grouped", group = "cond")
+pp_check(gain_skew_normal, ndraws = 100, type = "pit_ecdf_grouped", group = "class")
+
+summary(gain_skew_normal, prob = 0.95)
+#  Family: skew_normal 
+#   Links: mu = identity; sigma = log 
+# Formula: post - pre ~ 0 + cond + (0 + cond | class) 
+#          sigma ~ 0 + cond + (0 + cond | class)
+#    Data: dat (Number of observations: 1377) 
+#   Draws: 4 chains, each with iter = 5000; warmup = 2500; thin = 1;
+#          total post-warmup draws = 10000
+# 
+# Multilevel Hyperparameters:
+# ~class (Number of levels: 62) 
+#                                               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(condControl)                                   2.38      0.28     1.87     3.00 1.00     3378     5714
+# sd(condIntervention)                              1.99      0.37     1.33     2.77 1.00     4544     6183
+# sd(sigma_condControl)                             0.08      0.04     0.01     0.16 1.00     2593     3078
+# sd(sigma_condIntervention)                        0.07      0.05     0.00     0.18 1.00     3673     4570
+# cor(condControl,condIntervention)                 0.71      0.20     0.23     0.98 1.00     1950     3108
+# cor(sigma_condControl,sigma_condIntervention)    -0.10      0.57    -0.96     0.93 1.00     5796     6866
+# 
+# Regression Coefficients:
+#                        Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# condControl                5.83      0.35     5.13     6.52 1.00     2408     4312
+# condIntervention           6.02      0.40     5.23     6.80 1.00     4377     6050
+# sigma_condControl          1.47      0.03     1.41     1.52 1.00     8501     7550
+# sigma_condIntervention     1.47      0.04     1.39     1.55 1.00     9126     6397
+# 
+# Further Distributional Parameters:
+#       Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# alpha    -0.22      0.51    -1.09     0.73 1.00    10653     8593
+# 
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+chains_gain <- get_chains(gain_skew_normal)
+
+for (l in 1:length(unique(dat$class))) {
+  name <- paste0("d_z_", l, "_control")
+  name_control <- paste0("r_class.", l, ".condControl.")
+  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
+  
+  chains_gain[[name]] <- (chains_gain$b_condControl + chains_gain[names(chains_gain) == name_control])/sqrt(exp(2 * chains_gain$b_sigma_condControl + 2 * chains_gain[names(chains_gain) == name_sigma_control] + 2 * chains_gain$sd_class__sigma_condControl^2) + chains_gain$sd_class__condControl^2)
+}
+
+for (l in 1:length(unique(dat$class))) {
+  name <- paste0("d_z_", l, "_intervention")
+  name_intervention <- paste0("r_class.", l, ".condIntervention.")
+  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
+  
+  chains_gain[[name]] <- (chains_gain$b_condIntervention + chains_gain[names(chains_gain) == name_intervention])/sqrt(exp(2 * chains_gain$b_sigma_condIntervention + 2 * chains_gain[names(chains_gain) == name_sigma_intervention] + 2 * chains_gain$sd_class__sigma_condIntervention^2) + chains_gain$sd_class__condIntervention^2)
+}
+
+#Control Condition
+chains_gain$d_z_mean<- rowMeans(subset(chains_gain, select = c(d_z_1_control:d_z_62_control)), na.rm = TRUE)
+round(mean(chains_gain$d_z_mean), 2) #1.17
+bayestestR::hdi(chains_gain$d_z_mean, ci = 0.95) #95% HDI: [1.07, 1.28]
+chains_gain$d_z_sd <- apply(subset(chains_gain, select = c(d_z_1_control:d_z_62_control)), 1, sd)
+round(mean(chains_gain$d_z_sd), 2) #0.48
+bayestestR::hdi(chains_gain$d_z_sd, ci = 0.95) #95% HDI: [0.42, 0.55]
+
+#Intervention Condition
+chains_gain$d_z_mean<- rowMeans(subset(chains_gain, select = c(d_z_1_intervention:d_z_62_intervention)), na.rm = TRUE)
+round(mean(chains_gain$d_z_mean), 2) #1.25
+bayestestR::hdi(chains_gain$d_z_mean, ci = 0.95) #95% HDI: [1.07, 1.42]
+chains_gain$d_z_sd <- apply(subset(chains_gain, select = c(d_z_1_intervention:d_z_62_intervention)), 1, sd)
+round(mean(chains_gain$d_z_sd), 2) #0.42
+bayestestR::hdi(chains_gain$d_z_sd, ci = 0.95) #95% HDI: [0.30, 0.53]
+```
+
+##Student-t Distribution
+###Flat Priors
+```{r}
+gain_t_flat <- brm(bf(
+  post - pre ~ 0 + cond + (0 + cond|class),
+  sigma ~ 0 + cond + (0 + cond|class)),
+  family = student(),
+  data = dat,
+  warmup = 2500,
+  iter = 5000,
+  cores = parallel::detectCores(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  seed = 0
+)
+
+plot(gain_t_flat)
+
+#Grouped pp-Checks
+#Dense Overlay
+pp_check(gain_t_flat, ndraws = 100, type = "dens_overlay_grouped", group = "cond")
+pp_check(gain_t_flat, ndraws = 100, type = "dens_overlay_grouped", group = "class")
+
+#Residual Error
+pp_check(gain_t_flat, type = "error_scatter_avg_grouped", group = "cond")
+pp_check(gain_t_flat, type = "error_scatter_avg_grouped", group = "class")
+
+#PIT-ECDF
+pp_check(gain_t_flat, ndraws = 100, type = "pit_ecdf_grouped", group = "cond")
+pp_check(gain_t_flat, ndraws = 100, type = "pit_ecdf_grouped", group = "class")
+
+summary(gain_t_flat, prob = 0.95)
+#  Family: student 
+#   Links: mu = identity; sigma = log 
+# Formula: post - pre ~ 0 + cond + (0 + cond | class) 
+#          sigma ~ 0 + cond + (0 + cond | class)
+#    Data: dat (Number of observations: 1377) 
+#   Draws: 4 chains, each with iter = 5000; warmup = 2500; thin = 1;
+#          total post-warmup draws = 10000
+# 
+# Multilevel Hyperparameters:
+# ~class (Number of levels: 62) 
+#                                               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(condControl)                                   2.39      0.28     1.90     2.99 1.00     3543     5965
+# sd(condIntervention)                              2.01      0.38     1.33     2.82 1.00     4628     6961
+# sd(sigma_condControl)                             0.08      0.04     0.00     0.16 1.00     2437     3260
+# sd(sigma_condIntervention)                        0.07      0.05     0.00     0.18 1.00     4324     5335
+# cor(condControl,condIntervention)                 0.71      0.20     0.24     0.98 1.00     2464     3830
+# cor(sigma_condControl,sigma_condIntervention)    -0.07      0.57    -0.96     0.93 1.00     6648     7156
+# 
+# Regression Coefficients:
+#                        Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# condControl                5.82      0.36     5.11     6.51 1.00     2562     4038
+# condIntervention           6.02      0.41     5.20     6.81 1.00     4793     6125
+# sigma_condControl          1.44      0.03     1.38     1.50 1.00     8915     7393
+# sigma_condIntervention     1.45      0.04     1.37     1.53 1.00    11004     7771
+# 
+# Further Distributional Parameters:
+#    Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# nu    41.91     15.90    19.45    80.64 1.00    14687     6883
+# 
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+chains_gain <- get_chains(gain_t_flat)
+
+for (l in 1:length(unique(dat$class))) {
+  name <- paste0("d_z_", l, "_control")
+  name_control <- paste0("r_class.", l, ".condControl.")
+  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
+  
+  chains_gain[[name]] <- (chains_gain$b_condControl + chains_gain[names(chains_gain) == name_control])/sqrt(exp(2 * chains_gain$b_sigma_condControl + 2 * chains_gain[names(chains_gain) == name_sigma_control] + 2 * chains_gain$sd_class__sigma_condControl^2) + chains_gain$sd_class__condControl^2)
+}
+
+for (l in 1:length(unique(dat$class))) {
+  name <- paste0("d_z_", l, "_intervention")
+  name_intervention <- paste0("r_class.", l, ".condIntervention.")
+  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
+  
+  chains_gain[[name]] <- (chains_gain$b_condIntervention + chains_gain[names(chains_gain) == name_intervention])/sqrt(exp(2 * chains_gain$b_sigma_condIntervention + 2 * chains_gain[names(chains_gain) == name_sigma_intervention] + 2 * chains_gain$sd_class__sigma_condIntervention^2) + chains_gain$sd_class__condIntervention^2)
+}
+
+#Control Condition
+chains_gain$d_z_mean<- rowMeans(subset(chains_gain, select = c(d_z_1_control:d_z_62_control)), na.rm = TRUE)
+round(mean(chains_gain$d_z_mean), 2) #1.20
+bayestestR::hdi(chains_gain$d_z_mean, ci = 0.95) #95% HDI: [1.08, 1.31]
+chains_gain$d_z_sd <- apply(subset(chains_gain, select = c(d_z_1_control:d_z_62_control)), 1, sd)
+round(mean(chains_gain$d_z_sd), 2) #0.49
+bayestestR::hdi(chains_gain$d_z_sd, ci = 0.95) #95% HDI: [0.42, 0.56]
+
+#Intervention Condition
+chains_gain$d_z_mean<- rowMeans(subset(chains_gain, select = c(d_z_1_intervention:d_z_62_intervention)), na.rm = TRUE)
+round(mean(chains_gain$d_z_mean), 2) #1.27
+bayestestR::hdi(chains_gain$d_z_mean, ci = 0.95) #95% HDI: [1.09, 1.44]
+chains_gain$d_z_sd <- apply(subset(chains_gain, select = c(d_z_1_intervention:d_z_62_intervention)), 1, sd)
+round(mean(chains_gain$d_z_sd), 2) #0.43
+bayestestR::hdi(chains_gain$d_z_sd, ci = 0.95) #95% HDI: [0.31, 0.55]
+```
+
+###Normal Priors
+```{r}
+gain_t_normal <- brm(bf(
+  post - pre ~ 0 + cond + (0 + cond|class),
+  sigma ~ 0 + cond + (0 + cond|class)),
+  family = student(),
+  data = dat,
+  prior = c(
+    prior(normal(6, 3), class = "b"),
+    prior(normal(1, 2), class = "b", dpar = "sigma")
+  ),
+  warmup = 2500,
+  iter = 5000,
+  cores = parallel::detectCores(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  seed = 0
+)
+
+plot(gain_t_normal)
+
+#Grouped pp-Checks
+#Dense Overlay
+pp_check(gain_t_normal, ndraws = 100, type = "dens_overlay_grouped", group = "cond")
+pp_check(gain_t_normal, ndraws = 100, type = "dens_overlay_grouped", group = "class")
+
+#Residual Error
+pp_check(gain_t_normal, type = "error_scatter_avg_grouped", group = "cond")
+pp_check(gain_t_normal, type = "error_scatter_avg_grouped", group = "class")
+
+#PIT-ECDF
+pp_check(gain_t_normal, ndraws = 100, type = "pit_ecdf_grouped", group = "cond")
+pp_check(gain_t_normal, ndraws = 100, type = "pit_ecdf_grouped", group = "class")
+
+summary(gain_t_normal, prob = 0.95)
+#  Family: student 
+#   Links: mu = identity; sigma = log 
+# Formula: post - pre ~ 0 + cond + (0 + cond | class) 
+#          sigma ~ 0 + cond + (0 + cond | class)
+#    Data: dat (Number of observations: 1377) 
+#   Draws: 4 chains, each with iter = 5000; warmup = 2500; thin = 1;
+#          total post-warmup draws = 10000
+# 
+# Multilevel Hyperparameters:
+# ~class (Number of levels: 62) 
+#                                               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# sd(condControl)                                   2.39      0.28     1.89     3.01 1.00     3571     5676
+# sd(condIntervention)                              2.00      0.38     1.32     2.81 1.00     4515     6629
+# sd(sigma_condControl)                             0.07      0.04     0.00     0.16 1.00     2122     3188
+# sd(sigma_condIntervention)                        0.07      0.05     0.00     0.18 1.00     4165     4515
+# cor(condControl,condIntervention)                 0.71      0.20     0.22     0.98 1.00     2230     3893
+# cor(sigma_condControl,sigma_condIntervention)    -0.08      0.57    -0.96     0.94 1.00     6482     7033
+# 
+# Regression Coefficients:
+#                        Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# condControl                5.83      0.35     5.15     6.52 1.00     2615     4320
+# condIntervention           6.03      0.40     5.24     6.80 1.00     4734     7504
+# sigma_condControl          1.44      0.03     1.38     1.50 1.00     9021     6900
+# sigma_condIntervention     1.45      0.04     1.36     1.53 1.00    11213     6674
+# 
+# Further Distributional Parameters:
+#    Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+# nu    41.88     16.15    18.89    80.71 1.00    13613     7951
+# 
+# Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+# and Tail_ESS are effective sample size measures, and Rhat is the potential
+# scale reduction factor on split chains (at convergence, Rhat = 1).
+chains_gain <- get_chains(gain_t_normal)
+
+for (l in 1:length(unique(dat$class))) {
+  name <- paste0("d_z_", l, "_control")
+  name_control <- paste0("r_class.", l, ".condControl.")
+  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
+  
+  chains_gain[[name]] <- (chains_gain$b_condControl + chains_gain[names(chains_gain) == name_control])/sqrt(exp(2 * chains_gain$b_sigma_condControl + 2 * chains_gain[names(chains_gain) == name_sigma_control] + 2 * chains_gain$sd_class__sigma_condControl^2) + chains_gain$sd_class__condControl^2)
+}
+
+for (l in 1:length(unique(dat$class))) {
+  name <- paste0("d_z_", l, "_intervention")
+  name_intervention <- paste0("r_class.", l, ".condIntervention.")
+  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
+  
+  chains_gain[[name]] <- (chains_gain$b_condIntervention + chains_gain[names(chains_gain) == name_intervention])/sqrt(exp(2 * chains_gain$b_sigma_condIntervention + 2 * chains_gain[names(chains_gain) == name_sigma_intervention] + 2 * chains_gain$sd_class__sigma_condIntervention^2) + chains_gain$sd_class__condIntervention^2)
+}
+
+#Control Condition
+chains_gain$d_z_mean<- rowMeans(subset(chains_gain, select = c(d_z_1_control:d_z_62_control)), na.rm = TRUE)
+round(mean(chains_gain$d_z_mean), 2) #1.20
+bayestestR::hdi(chains_gain$d_z_mean, ci = 0.95) #95% HDI: [1.08, 1.30]
+chains_gain$d_z_sd <- apply(subset(chains_gain, select = c(d_z_1_control:d_z_62_control)), 1, sd)
+round(mean(chains_gain$d_z_sd), 2) #0.49
+bayestestR::hdi(chains_gain$d_z_sd, ci = 0.95) #95% HDI: [0.43, 0.56]
+
+#Intervention Condition
+chains_gain$d_z_mean<- rowMeans(subset(chains_gain, select = c(d_z_1_intervention:d_z_62_intervention)), na.rm = TRUE)
+round(mean(chains_gain$d_z_mean), 2) #1.27
+bayestestR::hdi(chains_gain$d_z_mean, ci = 0.95) #95% HDI: [1.10, 1.45]
+chains_gain$d_z_sd <- apply(subset(chains_gain, select = c(d_z_1_intervention:d_z_62_intervention)), 1, sd)
+round(mean(chains_gain$d_z_sd), 2) #0.43
+bayestestR::hdi(chains_gain$d_z_sd, ci = 0.95) #95% HDI: [0.31, 0.54]
+```
+
+##Simulation Study
+###Monte-Carlo Run
+```{r}
+library(doFuture)
+library(doRNG)
+library(progressr)
+
+load("data/estimates_d_z.RObject")
+
+#Global Simulation Settings
+set.seed(0)
+doFuture::registerDoFuture()
+plan(multisession, workers = 4)
+progressr::handlers(global = TRUE)
+n_rep <- 100
+
+n = 22
+n_cl = 62
+id <- 1:(n * n_cl)
+n_0 <- 15 * n_cl 
+n_1 <- 7 * n_cl
+  
+class <- rep(1:n_cl, each = n)
+cond <- c(rep(0, times = 15), rep(1, times = 7))
+
+mu_0 <- 5.83
+sd_mu_0 <- 2.38
+
+mu_1 <- 6.03
+sd_mu_1 <- 2.00
+
+sigma_0 <- 1.47
+sd_sigma_0 <- 0.08
+
+sigma_1 <- 1.47
+sd_sigma_1 <- 0.07
+
+d_z_exact_control <- mu_0/sqrt(exp(2 * sigma_0)) #1.340466
+d_z_exact_intervention <- mu_1/sqrt(exp(2 * sigma_1)) #1.386451
+
+d_z_cl_exact_control <- mu_0/sqrt(exp(2 * sigma_0 + 2 * sd_sigma_0^2) + sd_mu_0^2) #1.170128
+d_z_cl_exact_intervention <- mu_1/sqrt(exp(2 * sigma_1 + 2 * sd_sigma_1^2) + sd_mu_1^2) #1.25456
+
+loop <- function(r){
+    u_0l <- rnorm(n_cl, mean = 0, sd = sd_mu_0)
+    u_1l <- rnorm(n_cl, mean = 0, sd = sd_mu_1)
+  
+    dat <- data.frame(id, class, cond = factor(cond))
+    dat <- dat %>% mutate(
+      y = ifelse(cond == "0", mu_0 + u_0l[class], mu_1 + u_1l[class])
+    )
+    
+    sigma_0_l <- rlnorm(n_cl, mean = sigma_0, sd = sd_sigma_0)
+    sigma_1_l <- rlnorm(n_cl, mean = sigma_1, sd = sd_sigma_1)
+    
+    for (l in 1:n_cl){
+      eps_0_l <- rnorm(15, mean = 0, sigma_0_l[l])
+      eps_1_l <- rnorm(7, mean = 0, sigma_1_l[l])
+  
+      dat$y[cond == "0" & class == l] <- dat$y[cond == "0" & class == l] + eps_0_l 
+      dat$y[cond == "1" & class == l] <- dat$y[cond == "1" & class == l] + eps_1_l
+    }
+
+    fit_d_z <- brm(bf(
+        y ~ 0 + cond + (0 + cond|class),
+        sigma ~ 0 + cond + (0 + cond|class)),
+      data = dat,
+      warmup = 2500 , 
+      iter = 5000 , 
+      cores = parallel::detectCores (),
+      control = list(adapt_delta = 0.99 , max_treedepth = 15),
+      backend = "cmdstanr",
+      stan_model_args = list(stanc_options = list("O1")),
+      seed = 0,
+      normalize = FALSE
+    )
+    
+    sum_d_z <- summary(fit_d_z, prob = 0.95)
+  
+    d_z_control <- sum_d_z$fixed$Estimate[1]/sqrt(exp(2 * sum_d_z$fixed$Estimate[3] + 2 * sum_d_z$random$class$Estimate[3]^2) + sum_d_z$random$class$Estimate[1]^2)
+    
+    d_z_intervention <- sum_d_z$fixed$Estimate[2]/sqrt(exp(2 * sum_d_z$fixed$Estimate[4] + 2 * sum_d_z$random$class$Estimate[4]^2) + sum_d_z$random$class$Estimate[2]^2)
+    
+  p(message = sprintf("%d", r))
+  return(data.frame(r = r, d_z_control = d_z_control, d_z_intervention = d_z_intervention))
+}
+
+with_progress({
+  p <- progressor(steps = n_rep)
+  estimates_d_z <- foreach(r = 1:n_rep, .combine = 'rbind', .packages = "progressr") %dorng% loop(r)
+})
+
+save(estimates_d_z, file = "estimates_d_z.RObject")
+```
+
+###Results
+```{r}
+bias(estimates_d_z$d_z_control, d_z_cl_exact_control) #-1.215
+mse(estimates_d_z$d_z_control, d_z_cl_exact_control) #0.521
+mcse(estimates_d_z$d_z_control, d_z_cl_exact_control) #0.7
+
+bias(estimates_d_z$d_z_intervention, d_z_cl_exact_intervention) #-0.185
+mse(estimates_d_z$d_z_intervention, d_z_cl_exact_intervention) #0.506
+mcse(estimates_d_z$d_z_intervention, d_z_cl_exact_intervention) #0.7
+```
