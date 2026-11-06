@@ -61,9 +61,9 @@ mse <- function(x, theta){
 
 mcse <- function(x, theta){
   if (theta == 0){
-    return(100 * round(sd(x, na.rm = TRUE)/sqrt(n_rep), 3))
+    return(round(100 * sd(x, na.rm = TRUE)/sqrt(n_rep), 3))
   } else {
-    return(100 * round(sd(x, na.rm = TRUE)/(theta * sqrt(n_rep)), 3))
+    return(round(100 * sd(x, na.rm = TRUE)/(theta * sqrt(n_rep)), 3))
   }
 }
 ```
@@ -1066,164 +1066,6 @@ round(mean(chains_ttest_pr$d_s_sd), 2) #0.26
 bayestestR::hdi(chains_ttest_pr$d_s_sd, ci = 0.95) #95% HDI: [0.09, 0.42]
 ```
 
-###Simulation Study
-####Monte-Carlo Run
-```{r}
-library(doFuture)
-library(doRNG)
-library(progressr)
-
-load("data/estimates_d_s.RObject")
-
-#Global Simulation Settings
-set.seed(0)
-doFuture::registerDoFuture()
-plan(multisession, workers = 4)
-progressr::handlers(global = TRUE)
-n_rep <- 500
-
-n_cl <- 62          # Number of unique classes (groups)
-size_cl <- 22        # Number of observations per class
-n_tot <- n_cl * size_cl
-n_0 <- 930
-n_1 <- 434
-
-mu <- 9.52
-sd_mu <- 1.32
-
-kappa <- 0.87
-sd_kappa <- 1.14
-
-sigma_0 <- 1.26
-sd_sigma_0 <- 0.06
-
-sigma_1 <- 1.30
-sd_sigma_1 <- 0.09
-
-d_s_exact <- sqrt(n_0 + n_1 - 2) * kappa/sqrt((n_0 - 1) * exp(2 * sigma_0) + (n_1 - 1) * exp(2 * sigma_1)) #0.2435608
-
-d_s_cl_exact <- sqrt(n_0 + n_1 - 2) * kappa/sqrt((n_0 - 1) * (exp(2 * sigma_0 + 2 * sd_sigma_0^2) + sd_mu^2) + (n_1 - 1) * (exp(2 * sigma_1 + 2 * sd_sigma_1^2) + sd_kappa^2)) #0.2285399
-
-loop <- function(r){
-  class_effects <- data.frame(
-    class = factor(1:n_cl),
-    u0 = rnorm(n_cl, mean = 0, sd = sd_mu),
-    u1 = rnorm(n_cl, mean = 0, sd = sd_kappa),
-    v0 = rnorm(n_cl, mean = 0, sd = sd_sigma_0),
-    v1 = rnorm(n_cl, mean = 0, sd = sd_sigma_1)
-  )
-
-  sim_data <- data.frame(
-    class = factor(rep(1:n_cl, each = size_cl)),
-    cond  = rep(c(rep(0, times = 15), rep(1, times = 7)), times = n_cl)
-  ) %>%
-    left_join(class_effects, by = "class") %>%
-   mutate(
-      # Compute true Mu and Sigma for each observation
-      mu_i    = mu + kappa * cond + u0 * (1 - cond) + u1 * cond,
-      sigma_i = exp(sigma_0 * (1 - cond) + sigma_1 * cond + v0 * (1 - cond) + v1 * cond),
-      # Sample the outcome variable
-      y       = rnorm(n_tot, mean = mu_i, sd = sigma_i)
-    )
-  
-    sim_data <- sim_data %>% mutate(
-      y = ifelse(y > 26, 26, ifelse(y < 0, 0, y)),
-      cond = as.factor(cond)
-    )
-
-   fit_d_s <- brm(bf(
-        y ~ cond,
-        sigma ~ 0 + cond),
-      family = gaussian(),
-      data = sim_data ,
-      warmup = 2500 , 
-      iter = 5000 , 
-      cores = parallel::detectCores (),
-      control = list(adapt_delta = 0.99 , max_treedepth = 15),
-      backend = "cmdstanr",
-      stan_model_args = list(stanc_options = list("O1")),
-      seed = 0,
-      normalize = FALSE
-    )
-    
-    sum_d_s <- summary(fit_d_s, prob = 0.95)
-  
-    d_s <- sqrt(n_0 + n_1 - 2) * sum_d_s$fixed$Estimate[2]/sqrt((n_0 - 1) * exp(2 * sum_d_s$fixed$Estimate[3]) + (n_1 - 1) * exp(2 * sum_d_s$fixed$Estimate[4]))
-
-    fit_d_s_cl <- brm(bf(
-        y ~ cond + (0 + cond||class),
-        sigma ~ 0 + cond + (0 + cond||class)),
-      family = gaussian(),
-      data =  sim_data,
-      warmup = 2500 , 
-      iter = 5000 , 
-      cores = parallel::detectCores (),
-      control = list(adapt_delta = 0.99 , max_treedepth = 15),
-      backend = "cmdstanr",
-      stan_model_args = list(stanc_options = list("O1")),
-      seed = 0,
-      normalize = FALSE
-    )
-    
-    sum_d_s <- summary(fit_d_s_cl, prob = 0.95)
-  
-    d_s_cl <- sqrt(n_0 + n_1 - 2) * sum_d_s$fixed$Estimate[2]/sqrt((n_0 - 1) * (exp(2 * sum_d_s$fixed$Estimate[3] + 2 * sum_d_s$random$class$Estimate[3]^2) + sum_d_s$random$class$Estimate[1]^2) + (n_1 - 1) * (exp(2 * sum_d_s$fixed$Estimate[4] + 2 * sum_d_s$random$class$Estimate[4]^2) + sum_d_s$random$class$Estimate[2]^2))
-    
-    
-    sim_data <- sim_data %>% mutate(y = y/26)
-
-    fit_d_s_ZOIB <- brm(bf(
-      y ~ 0 + cond,
-      phi ~ 0 + cond),
-      family = zero_one_inflated_beta(),
-      data = sim_data,
-      warmup = 2500, 
-      iter = 5000, 
-      cores = parallel::detectCores (),
-      control = list(adapt_delta = 0.99 , max_treedepth = 15),
-      backend = "cmdstanr",
-      stan_model_args = list(stanc_options = list("O1")),
-      seed = 0,
-      normalize = FALSE
-  )
-        
-    sum_d_s_ZOIB <- summary(fit_d_s_ZOIB, prob = 0.95)
-    
-    mu_0 <- invlogit(sum_d_s_ZOIB$fixed$Estimate[1])
-    mu_1 <- invlogit(sum_d_s_ZOIB$fixed$Estimate[2])
-    
-    sigma_0 <- sqrt((mu_0 * (1 - mu_0))/(exp(sum_d_s_ZOIB$fixed$Estimate[3]) + 1))
-    sigma_1 <- sqrt((mu_1 * (1 - mu_1))/(exp(sum_d_s_ZOIB$fixed$Estimate[4]) + 1))
-    
-    d_s_ZOIB <- sqrt(n_0 + n_1 - 2) * (invlogit(sum_d_s_ZOIB$fixed$Estimate[2]) - invlogit(sum_d_s_ZOIB$fixed$Estimate[1]))/sqrt((n_0 - 1) * sigma_0^2 + (n_1 - 1) * sigma_1^2)
-    
-  p(message = sprintf("%d", r))
-  return(data.frame(r = r, d_s = d_s, d_s_cl = d_s_cl, d_s_ZOIB = d_s_ZOIB))
-}
-
-with_progress({
-  p <- progressor(steps = n_rep)
-  estimates_d_s <- foreach(r = 1:n_rep, .combine = 'rbind', .packages = "progressr") %dorng% loop(r)
-})
-
-save(estimates_d_s, file = "estimates_d_s.RObject")
-```
-
-####Results
-```{r}
-bias(estimates_d_s$d_s, d_s_exact) #-4.394
-mse(estimates_d_s$d_s, d_s_exact) #11.617
-mcse(estimates_d_s$d_s, d_s_exact) #1.5
-
-bias(estimates_d_s$d_s_cl, d_s_cl_exact) #1.585
-mse(estimates_d_s$d_s_cl, d_s_cl_exact) #13.025
-mcse(estimates_d_s$d_s_cl, d_s_cl_exact) #1.6
-
-bias(estimates_d_s$d_s_ZOIB, d_s_exact) #-6.548
-mse(estimates_d_s$d_s_ZOIB, d_s_exact) #11.441
-mcse(estimates_d_s$d_s_ZOIB, d_s_exact) #1.5
-```
-
 ###Zero-One-Inflated Beta
 ####Flat Priors
 ```{r}
@@ -1360,6 +1202,348 @@ chains_ttest_pr$d_s <- sqrt(n - 2) * (mu_1 - mu_0)/sqrt((n_1 - 1) * sigma_0^2 + 
 
 round(mean(chains_ttest_pr$d_s), 2) #0.29
 bayestestR::hdi(chains_ttest_pr$d_s, ci = 0.95) #95% HDI: [0.17, 0.40]
+```
+
+###Simulation Study
+####Monte-Carlo Run
+```{r}
+library(doFuture)
+library(doRNG)
+library(progressr)
+
+#Global Simulation Settings
+set.seed(0)
+registerDoFuture()
+plan(multisession, workers = 6)
+handlers(global = TRUE)
+handlers("cli")            # Alternatively use "progress" or "txtprogressbar" if desired
+n_rep <- 480
+all_results <- list()
+
+beta_0 <- 9.50        # Control condition mean
+beta_1 <- 1.00        # Treatment difference mean
+  
+gamma_0 <- 1.26      # Control condition log-sigma baseline sd
+gamma_1 <- 1.30    # Treatment condition log-sigma baseline sd
+        
+sd_0 <- 1.30          # Control condition random location standard deviation
+sd_1 <- 1.30          # Treatment condition random location standard deviation
+rho_u <- 0.70         # Correlation random location slopes 
+  
+sd_sigma_0 <- 0.05    # Control condition random scale standard deviation
+sd_sigma_1 <- 0.10  # Treatment condition random scale standard deviation
+rho_v <- 0.20         # Correlation random scale slopes 
+
+J_classes <- 62
+p_val <- (438 - 1)/(1377 - 2)
+
+loop <- function(r){
+  # Generate correlated cluster-level location deviations (u_0j, u_1j)
+  Sigma_u <- matrix(
+    c(sd_0^2, rho_u * sd_0 * sd_1,
+      rho_u * sd_0 * sd_1, sd_1^2
+      ), nrow = 2)
+  
+  u_deviations <- MASS::mvrnorm(J_classes, mu = c(0, 0), Sigma = Sigma_u)
+  
+  # Generate correlated cluster-level scale deviations (v_0j, v_1j)
+  Sigma_v <- matrix(
+    c(sd_sigma_0^2, rho_v * sd_sigma_0 * sd_sigma_1,
+      rho_v * sd_sigma_0 * sd_sigma_1, sd_sigma_1^2
+    ), nrow = 2)
+  
+  v_deviations <- MASS::mvrnorm(J_classes, mu = c(0, 0), Sigma = Sigma_v)
+
+  clust <- tibble(
+    clus = 1:J_classes,
+    u_0j = u_deviations[, 1],
+    u_1j = u_deviations[, 2],
+    v_0j = v_deviations[, 1],
+    v_1j = v_deviations[, 2]
+  )
+    
+  clust$n_j <- rpois(J_classes, lambda = 22) %>% pmax(10)
+
+  # Expand to individual observations (within-cluster randomization)
+  df <- clust %>%
+    uncount(n_j) %>%
+    group_by(clus) %>%
+    mutate(
+    cond = rbinom(length(clus), size = 1, prob = 438/1377),
+
+    # Compute individual parameters using cell-means structure
+    mu_ij = if_else(cond == 0, beta_0 + u_0j, beta_0 + beta_1 + u_1j),
+    log_sigma_ij = if_else(cond == 0, gamma_0 + v_0j, gamma_1 + v_1j),
+    sigma_ij = exp(log_sigma_ij),
+    y = rnorm(length(clus), mean = mu_ij, sd = sigma_ij)
+    ) %>%
+    ungroup()
+    
+  df <- df %>% dplyr::select(clus, cond, y)
+  
+  # Calculate true population hybrid SMD 
+  var_total_0_cl <- sd_0^2 + exp(2 * gamma_0 + 2 * sd_sigma_0^2)
+  var_total_1_cl <- sd_1^2 + exp(2 * gamma_1 + 2 * sd_sigma_1^2)
+  sigma_global_sq_cl <- (1 - p_val) * var_total_0_cl + p_val * var_total_1_cl
+  true_smd_cl <- beta_1 / sqrt(sigma_global_sq_cl)
+  true_smd <- beta_1/sqrt((1 - p_val) * exp(2 * gamma_0) + p_val * exp(2 * gamma_1))
+  
+  df <- df %>% mutate(
+    y = ifelse(y > 26, 26, ifelse(y < 0, 0, y)),
+    cond = as.factor(cond)
+  )
+  
+  # nrow(df %>% filter(cond == 0)) #939
+  # nrow(df %>% filter(cond == 1)) #438
+  # 
+  # df %>% ggplot(aes(x = cond, y = y)) + geom_violin() + geom_boxplot(width = 0.15, alpha = 1/5) + stat_summary(fun = mean, colour = "black", geom = "point", shape = 18, size = 6, show.legend = FALSE) + theme_classic(base_size = font) + ylim(0, 26)
+  
+  # Fit full model
+  fit_full <- brm(bf(
+      y ~ cond + (0 + cond|clus),
+      sigma ~ 0 + cond + (0 + cond|clus), decomp = "QR"),
+    family = gaussian(),
+    data = df ,
+    warmup = 2000,
+    iter = 4000,
+    chains = 3,
+    cores = parallel::detectCores (),
+    control = list(adapt_delta = 0.99 , max_treedepth = 15),
+    backend = "cmdstanr",
+    stan_model_args = list(stanc_options = list("O1")),
+    seed = 0,
+    normalize = FALSE,
+    refresh = 0,
+    silent = 2
+  )
+
+  # pp_check(fit_full, type = "dens_overlay", ndraws = 100)
+  # pp_check(fit_full, type = "dens_overlay_grouped", ndraws = 100, group = "cond")
+  # pp_check(fit_full, type = "dens_overlay_grouped", ndraws = 100, group = "clus")
+  #
+  # pp_check(fit_full, type = "pit_ecdf", ndraws = 100)
+  # pp_check(fit_full, type = "pit_ecdf_grouped", ndraws = 100, group = "cond")
+  # pp_check(fit_full, type = "pit_ecdf_grouped", ndraws = 100, group = "clus")
+  #
+  # pp_check(fit_full, type = "error_scatter_avg")
+  # pp_check(fit_full, type = "error_scatter_avg_grouped", group = "cond")
+  # pp_check(fit_full, type = "error_scatter_avg_grouped", group = "clus")
+  #
+  # pp_check(fit_full, type = "loo_pit_ecdf", ndraws = 100)
+
+  prediction_grid <- expand_grid(
+    clus = unique(df$clus),
+    cond = unique(df$cond)
+  )
+
+  draws <- as_draws_df(fit_full)
+
+  cluster_ids <- unique(df$clus) # Extract all unique cluster names
+
+  clusterwise_smd <- lapply(cluster_ids, function(j) {
+
+    name_u_0 <- paste0("r_clus[", j, ",cond0]")
+    name_u_1 <- paste0("r_clus[", j, ",cond1]")
+
+    name_v_0  <- paste0("r_clus__sigma[", j, ",cond0]")
+    name_v_1 <- paste0("r_clus__sigma[", j, ",cond1]")
+
+    draws %>%
+      dplyr::select(
+        .draw,
+        # Fixed effects
+        beta_0 = b_Intercept,
+        beta_1 = b_cond1,
+        gamma_0 = b_sigma_cond0,
+        gamma_1 = b_sigma_cond1,
+        # Global random standard deviations
+        sd_0    = sd_clus__cond0,
+        sd_1    = sd_clus__cond1,
+        sd_sigma_0  = sd_clus__sigma_cond0,
+        sd_sigma_1  = sd_clus__sigma_cond1,
+        # Cluster-specific random effects
+        u_0      = all_of(name_u_0),
+        u_1     = all_of(name_u_1),
+        v_0     = all_of(name_v_0),
+        v_1    = all_of(name_v_1)
+      ) %>%
+      mutate(
+        clus = j, # Track cluster
+
+        V_0 = sd_0^2 + exp(2 * gamma_0 + 2 * sd_sigma_0^2 + 2 * v_0),
+        V_1 = sd_1^2 + exp(2 * gamma_1 + 2 * sd_sigma_1^2 + 2 * v_1),
+        var_glob = (1 - p_val) * V_0 + p_val * V_1,
+        hybrid_smd = (beta_1 + u_1 - u_0) / sqrt(var_glob)
+      ) %>%
+      dplyr::select(clus, .draw, hybrid_smd)
+      }) %>%
+        bind_rows()
+
+  mean_smd_per_draw <- clusterwise_smd %>%
+    group_by(.draw) %>%
+    dplyr::summarize(
+      mean_hybrid_smd = mean(hybrid_smd),
+      .groups = "drop"
+    )
+
+  summary_full <- mean_smd_per_draw %>%
+    mean_hdci(mean_hybrid_smd) %>%
+    mutate(model = "full", true_val = true_smd_cl)
+
+  # Fit possibly misspecified reduced model
+  fit_red <- brm(bf(
+      y ~ cond,
+      sigma ~ 0 + cond, decomp = "QR"),
+    family = gaussian(),
+    data = df,
+    warmup = 2000,
+    iter = 4000,
+    chains = 3,
+    cores = parallel::detectCores (),
+    control = list(adapt_delta = 0.99 , max_treedepth = 15),
+    backend = "cmdstanr",
+    stan_model_args = list(stanc_options = list("O1")),
+    seed = 0,
+    normalize = FALSE,
+    silent = 2,
+    refresh = 0
+  )
+
+  # pp_check(fit_red, type = "dens_overlay", ndraws = 100)
+  # pp_check(fit_red, type = "dens_overlay_grouped", ndraws = 100, group = "cond")
+  #
+  # pp_check(fit_red, type = "pit_ecdf", ndraws = 100)
+  # pp_check(fit_red, type = "pit_ecdf_grouped", ndraws = 100, group = "cond")
+  #
+  # pp_check(fit_red, type = "error_scatter_avg")
+  # pp_check(fit_red, type = "error_scatter_avg_grouped", group = "cond")
+  #
+  # pp_check(fit_red, type = "loo_pit_ecdf", ndraws = 100)
+
+  prediction_grid <- expand_grid(
+    cond = unique(df$cond)
+  )
+
+  draws <- as_draws_df(fit_red)
+
+  draws <- draws %>%
+    dplyr::select(
+    .draw,
+    # Fixed effects
+    beta_0 = b_Intercept,
+    beta_1 = b_cond1,
+    gamma_0 = b_sigma_cond0,
+    gamma_1 = b_sigma_cond1
+    ) %>%
+    mutate(
+      V_0 = exp(2 * gamma_0),
+      V_1 = exp(2 * gamma_1),
+      V = (1 - p_val) * V_0 + p_val * V_1,
+      mean_hybrid_smd = beta_1 / sqrt(V)
+    ) %>%
+    dplyr::select(.draw, mean_hybrid_smd) %>% bind_rows()
+
+  summary_red <- draws %>%
+    mean_hdci(mean_hybrid_smd) %>%
+    mutate(model = "reduced", true_val = true_smd)
+  
+  df <- df %>% mutate(
+    y = y/26
+  )
+  
+  # Fit ZOIB model
+  fit_ZOIB <- brm(bf(
+      y ~ 0 + cond,
+      phi ~ 0 + cond, decomp = "QR"),
+    family = zero_one_inflated_beta(),
+    data = df,
+    warmup = 2000, 
+    iter = 4000, 
+    chains = 3,
+    cores = parallel::detectCores (),
+    control = list(adapt_delta = 0.99 , max_treedepth = 15),
+    backend = "cmdstanr",
+    stan_model_args = list(stanc_options = list("O1")),
+    seed = 0,
+    normalize = FALSE,
+    silent = 2,
+    refresh = 0
+  )
+
+  # pp_check(fit_ZOIB, type = "dens_overlay", ndraws = 100)
+  # pp_check(fit_ZOIB, type = "dens_overlay_grouped", ndraws = 100, group = "cond")
+  # 
+  # pp_check(fit_ZOIB, type = "pit_ecdf", ndraws = 100)
+  # pp_check(fit_ZOIB, type = "pit_ecdf_grouped", ndraws = 100, group = "cond")
+  # 
+  # pp_check(fit_ZOIB, type = "error_scatter_avg")
+  # pp_check(fit_ZOIB, type = "error_scatter_avg_grouped", group = "cond")
+  # 
+  # pp_check(fit_ZOIB, type = "loo_pit_ecdf", ndraws = 100)
+  
+  prediction_grid <- expand_grid(
+    cond = unique(df$cond)
+  )
+
+  draws <- as_draws_df(fit_ZOIB)
+  
+  draws <- draws %>%
+    dplyr::select(
+    .draw,
+    # Fixed effects
+    beta_0 = b_cond0,
+    beta_1 = b_cond1,
+    phi_0 = b_phi_cond0,
+    phi_1 = b_phi_cond1
+    ) %>%
+    mutate(
+      mu_0 = invlogit(beta_0),
+      mu_1 = invlogit(beta_1),
+      V_0 = sigma_ZOIB(mu_0, phi_0)^2,
+      V_1 = sigma_ZOIB(mu_1, phi_1)^2,
+      V = (1 - p_val) * V_0 + p_val * V_1,
+      mean_hybrid_smd = (invlogit(beta_1) - invlogit(beta_0)) / sqrt(V)
+    ) %>%
+    dplyr::select(.draw, mean_hybrid_smd) %>% bind_rows()
+    
+  summary_ZOIB <- draws %>%
+    mean_hdci(mean_hybrid_smd) %>%
+    mutate(model = "ZOIB", true_val = true_smd)
+  
+  p(message = sprintf("Rep %d", r))
+     
+  #Summarise results
+  bind_rows(summary_full, summary_red, summary_ZOIB) %>%
+    dplyr::select(model, estimate = mean_hybrid_smd, conf.low = .lower, conf.high = .upper, true_val)
+}
+
+with_progress({
+  p <- progressor(steps = n_rep)
+  suppressWarnings(estimates_d_s <- foreach(r = 1:n_rep, .combine = 'rbind', .packages = "progressr") %dorng% loop(r))
+})
+
+save(estimates_d_s, file = "estimates_d_s.RObject")
+```
+
+####Results
+```{r}
+full <- estimates_d_s %>% filter(model == "full")
+
+bias(full$estimate, unique(full$true_val)) #-0.061
+mse(full$estimate, unique(full$true_val)) #6.19
+mcse(full$estimate, unique(full$true_val)) #1.137
+
+red <- estimates_d_s %>% filter(model == "reduced")
+
+bias(red$estimate, unique(red$true_val)) #-5.829
+mse(red$estimate, unique(red$true_val)) #5.918
+mcse(red$estimate, unique(red$true_val)) #1.079
+
+ZOIB <- estimates_d_s %>% filter(model == "ZOIB")
+
+bias(ZOIB$estimate, unique(ZOIB$true_val)) #-7.732
+mse(ZOIB$estimate, unique(ZOIB$true_val)) #5.761
+mcse(ZOIB$estimate, unique(ZOIB$true_val)) #1.038
 ```
 
 ##Posttest
@@ -2666,89 +2850,196 @@ library(doFuture)
 library(doRNG)
 library(progressr)
 
-load("data/estimates_d_z.RObject")
-
 #Global Simulation Settings
 set.seed(0)
-doFuture::registerDoFuture()
-plan(multisession, workers = 4)
-progressr::handlers(global = TRUE)
-n_rep <- 100
+registerDoFuture()
+plan(multisession, workers = 6)
+handlers(global = TRUE)
+handlers("cli")            # Alternatively use "progress" or "txtprogressbar" if desired
+n_rep <- 120
+all_results <- list()
 
-n = 22
-n_cl = 62
-id <- 1:(n * n_cl)
-n_0 <- 15 * n_cl 
-n_1 <- 7 * n_cl
+beta_0 <- 5.85        # Control condition mean
+beta_1 <- 6.05        # Treatment difference mean
   
-class <- rep(1:n_cl, each = n)
-cond <- c(rep(0, times = 15), rep(1, times = 7))
+gamma_0 <- 1.50      # Control condition log-sigma baseline sd
+gamma_1 <- 1.50    # Treatment condition log-sigma baseline sd
+        
+sd_0 <- 2.40          # Control condition random location standard deviation
+sd_1 <- 2.00          # Treatment condition random location standard deviation
+rho_u <- 0.70         # Correlation random location slopes 
+  
+sd_sigma_0 <- 0.08    # Control condition random scale standard deviation
+sd_sigma_1 <- 0.07  # Treatment condition random scale standard deviation
+rho_v <- -0.10        # Correlation random scale slopes 
 
-mu_0 <- 5.83
-sd_mu_0 <- 2.38
-
-mu_1 <- 6.03
-sd_mu_1 <- 2.00
-
-sigma_0 <- 1.47
-sd_sigma_0 <- 0.08
-
-sigma_1 <- 1.47
-sd_sigma_1 <- 0.07
-
-d_z_exact_control <- mu_0/sqrt(exp(2 * sigma_0)) #1.340466
-d_z_exact_intervention <- mu_1/sqrt(exp(2 * sigma_1)) #1.386451
-
-d_z_cl_exact_control <- mu_0/sqrt(exp(2 * sigma_0 + 2 * sd_sigma_0^2) + sd_mu_0^2) #1.170128
-d_z_cl_exact_intervention <- mu_1/sqrt(exp(2 * sigma_1 + 2 * sd_sigma_1^2) + sd_mu_1^2) #1.25456
+J_classes <- 62
 
 loop <- function(r){
-    u_0l <- rnorm(n_cl, mean = 0, sd = sd_mu_0)
-    u_1l <- rnorm(n_cl, mean = 0, sd = sd_mu_1)
+  # Generate correlated cluster-level location deviations (u_0j, u_1j)
+  Sigma_u <- matrix(
+    c(sd_0^2, rho_u * sd_0 * sd_1,
+      rho_u * sd_0 * sd_1, sd_1^2
+      ), nrow = 2)
   
-    dat <- data.frame(id, class, cond = factor(cond))
-    dat <- dat %>% mutate(
-      y = ifelse(cond == "0", mu_0 + u_0l[class], mu_1 + u_1l[class])
-    )
-    
-    sigma_0_l <- rlnorm(n_cl, mean = sigma_0, sd = sd_sigma_0)
-    sigma_1_l <- rlnorm(n_cl, mean = sigma_1, sd = sd_sigma_1)
-    
-    for (l in 1:n_cl){
-      eps_0_l <- rnorm(15, mean = 0, sigma_0_l[l])
-      eps_1_l <- rnorm(7, mean = 0, sigma_1_l[l])
+  u_deviations <- MASS::mvrnorm(J_classes, mu = c(0, 0), Sigma = Sigma_u)
   
-      dat$y[cond == "0" & class == l] <- dat$y[cond == "0" & class == l] + eps_0_l 
-      dat$y[cond == "1" & class == l] <- dat$y[cond == "1" & class == l] + eps_1_l
-    }
+  # Generate correlated cluster-level scale deviations (v_0j, v_1j)
+  Sigma_v <- matrix(
+    c(sd_sigma_0^2, rho_v * sd_sigma_0 * sd_sigma_1,
+      rho_v * sd_sigma_0 * sd_sigma_1, sd_sigma_1^2
+    ), nrow = 2)
+  
+  v_deviations <- MASS::mvrnorm(J_classes, mu = c(0, 0), Sigma = Sigma_v)
 
-    fit_d_z <- brm(bf(
-        y ~ 0 + cond + (0 + cond|class),
-        sigma ~ 0 + cond + (0 + cond|class)),
-      data = dat,
-      warmup = 2500 , 
-      iter = 5000 , 
-      cores = parallel::detectCores (),
-      control = list(adapt_delta = 0.99 , max_treedepth = 15),
-      backend = "cmdstanr",
-      stan_model_args = list(stanc_options = list("O1")),
-      seed = 0,
-      normalize = FALSE
-    )
+  clust <- tibble(
+    clus = 1:J_classes,
+    u_0j = u_deviations[, 1],
+    u_1j = u_deviations[, 2],
+    v_0j = v_deviations[, 1],
+    v_1j = v_deviations[, 2]
+  )
     
-    sum_d_z <- summary(fit_d_z, prob = 0.95)
+  clust$n_j <- rpois(J_classes, lambda = 22) %>% pmax(10)
+
+  # Expand to individual observations (within-cluster randomization)
+  df <- clust %>%
+    uncount(n_j) %>%
+    group_by(clus) %>%
+    mutate(
+    cond = rbinom(length(clus), size = 1, prob = 438/1377),
+
+    # Compute individual parameters using cell-means structure
+    mu_ij = if_else(cond == 0, beta_0 + u_0j, beta_1 + u_1j),
+    log_sigma_ij = if_else(cond == 0, gamma_0 + v_0j, gamma_1 + v_1j),
+    sigma_ij = exp(log_sigma_ij),
+    y = rnorm(length(clus), mean = mu_ij, sd = sigma_ij)
+    ) %>%
+    ungroup()
+    
+  df <- df %>% dplyr::select(clus, cond, y)
   
-    d_z_control <- sum_d_z$fixed$Estimate[1]/sqrt(exp(2 * sum_d_z$fixed$Estimate[3] + 2 * sum_d_z$random$class$Estimate[3]^2) + sum_d_z$random$class$Estimate[1]^2)
+  # Calculate true population hybrid SMD 
+  var_total_0_cl <- sd_0^2 + exp(2 * gamma_0 + 2 * sd_sigma_0^2)
+  var_total_1_cl <- sd_1^2 + exp(2 * gamma_1 + 2 * sd_sigma_1^2)
+  true_smd_0 <- beta_0 / sqrt(var_total_0_cl)
+  true_smd_1 <- beta_1 / sqrt(var_total_1_cl)
+  
+  df <- df %>% mutate(
+    cond = as.factor(cond)
+  )
+  
+  # nrow(df %>% filter(cond == 0)) #939
+  # nrow(df %>% filter(cond == 1)) #438
+  # 
+  # df %>% ggplot(aes(x = cond, y = y)) + geom_violin() + geom_boxplot(width = 0.15, alpha = 1/5) + stat_summary(fun = mean, colour = "black", geom = "point", shape = 18, size = 6, show.legend = FALSE) + theme_classic(base_size = font)
+  
+  # Fit full model
+  fit_full <- brm(bf(
+      y ~ 0 + cond + (0 + cond|clus),
+      sigma ~ 0 + cond + (0 + cond|clus), decomp = "QR"),
+    family = gaussian(),
+    data = df ,
+    warmup = 2000,
+    iter = 4000,
+    chains = 3,
+    cores = parallel::detectCores (),
+    control = list(adapt_delta = 0.99 , max_treedepth = 15),
+    backend = "cmdstanr",
+    stan_model_args = list(stanc_options = list("O1")),
+    seed = 0,
+    normalize = FALSE,
+    silent = 2,
+    refresh = 0
+  )
+
+  # pp_check(fit_full, type = "dens_overlay", ndraws = 100)
+  # pp_check(fit_full, type = "dens_overlay_grouped", ndraws = 100, group = "cond")
+  # pp_check(fit_full, type = "dens_overlay_grouped", ndraws = 100, group = "clus")
+  #
+  # pp_check(fit_full, type = "pit_ecdf", ndraws = 100)
+  # pp_check(fit_full, type = "pit_ecdf_grouped", ndraws = 100, group = "cond")
+  # pp_check(fit_full, type = "pit_ecdf_grouped", ndraws = 100, group = "clus")
+  #
+  # pp_check(fit_full, type = "error_scatter_avg")
+  # pp_check(fit_full, type = "error_scatter_avg_grouped", group = "cond")
+  # pp_check(fit_full, type = "error_scatter_avg_grouped", group = "clus")
+  #
+  # pp_check(fit_full, type = "loo_pit_ecdf", ndraws = 100)
+
+  prediction_grid <- expand_grid(
+    clus = unique(df$clus),
+    cond = unique(df$cond)
+  )
+  
+  draws <- as_draws_df(fit_full)
+
+  cluster_ids <- unique(df$clus) # Extract all unique cluster names
+
+  clusterwise_smd <- lapply(cluster_ids, function(j) {
+
+    name_u_0 <- paste0("r_clus[", j, ",cond0]")
+    name_u_1 <- paste0("r_clus[", j, ",cond1]")
+
+    name_v_0  <- paste0("r_clus__sigma[", j, ",cond0]")
+    name_v_1 <- paste0("r_clus__sigma[", j, ",cond1]")
+
+    draws %>%
+      dplyr::select(
+        .draw,
+        # Fixed effects
+        beta_0 = b_cond0,
+        beta_1 = b_cond1,
+        gamma_0 = b_sigma_cond0,
+        gamma_1 = b_sigma_cond1,
+        # Global random standard deviations
+        sd_0    = sd_clus__cond0,
+        sd_1    = sd_clus__cond1,
+        sd_sigma_0  = sd_clus__sigma_cond0,
+        sd_sigma_1  = sd_clus__sigma_cond1,
+        # Cluster-specific random effects
+        u_0      = all_of(name_u_0),
+        u_1     = all_of(name_u_1),
+        v_0     = all_of(name_v_0),
+        v_1    = all_of(name_v_1)
+      ) %>%
+      mutate(
+        clus = j, # Track cluster
+
+        V_0 = sd_0^2 + exp(2 * gamma_0 + 2 * sd_sigma_0^2 + 2 * v_0),
+        V_1 = sd_1^2 + exp(2 * gamma_1 + 2 * sd_sigma_1^2 + 2 * v_1),
+        smd_0 = (beta_0 + u_0) / sqrt(V_0),
+        smd_1 = (beta_1 + u_1) / sqrt(V_1)
+      ) %>%
+      dplyr::select(clus, .draw, smd_0, smd_1)
+      }) %>%
+        bind_rows()
+
+  mean_smd_per_draw <- clusterwise_smd %>%
+    group_by(.draw) %>%
+    dplyr::summarize(
+      mean_smd_0 = mean(smd_0),
+      mean_smd_1 = mean(smd_1),
+      .groups = "drop"
+    )
+
+  summary_0 <- mean_smd_per_draw %>%
+    mean_hdci(mean_smd_0) %>%
+    mutate(model = "cond_0", true_val = true_smd_0) %>% dplyr::rename(estimate = mean_smd_0)
     
-    d_z_intervention <- sum_d_z$fixed$Estimate[2]/sqrt(exp(2 * sum_d_z$fixed$Estimate[4] + 2 * sum_d_z$random$class$Estimate[4]^2) + sum_d_z$random$class$Estimate[2]^2)
+  summary_1 <- mean_smd_per_draw %>%
+    mean_hdci(mean_smd_1) %>%
+    mutate(model = "cond_1", true_val = true_smd_1) %>% dplyr::rename(estimate = mean_smd_1)
     
-  p(message = sprintf("%d", r))
-  return(data.frame(r = r, d_z_control = d_z_control, d_z_intervention = d_z_intervention))
+  p(message = sprintf("Rep %d", r))
+     
+  #Summarise results
+  bind_rows(summary_0, summary_1) 
 }
 
 with_progress({
   p <- progressor(steps = n_rep)
-  estimates_d_z <- foreach(r = 1:n_rep, .combine = 'rbind', .packages = "progressr") %dorng% loop(r)
+  suppressWarnings(estimates_d_z <- foreach(r = 1:n_rep, .combine = 'rbind', .packages = "progressr") %dorng% loop(r))
 })
 
 save(estimates_d_z, file = "estimates_d_z.RObject")
@@ -2756,11 +3047,15 @@ save(estimates_d_z, file = "estimates_d_z.RObject")
 
 ###Results
 ```{r}
-bias(estimates_d_z$d_z_control, d_z_cl_exact_control) #-1.215
-mse(estimates_d_z$d_z_control, d_z_cl_exact_control) #0.521
-mcse(estimates_d_z$d_z_control, d_z_cl_exact_control) #0.7
+cond_0 <- estimates_d_z %>% filter(model == "cond_0")
 
-bias(estimates_d_z$d_z_intervention, d_z_cl_exact_intervention) #-0.185
-mse(estimates_d_z$d_z_intervention, d_z_cl_exact_intervention) #0.506
-mcse(estimates_d_z$d_z_intervention, d_z_cl_exact_intervention) #0.7
+bias(cond_0$estimate, unique(cond_0$true_val)) #0.462
+mse(cond_0$estimate, unique(cond_0$true_val)) #0.472
+mcse(cond_0$estimate, unique(cond_0$true_val)) #0.628
+
+cond_1 <- estimates_d_z %>% filter(model == "cond_1")
+
+bias(cond_1$estimate, unique(cond_1$true_val)) #0.439
+mse(cond_1$estimate, unique(cond_1$true_val)) #0.379
+mcse(cond_1$estimate, unique(cond_1$true_val)) #0.563
 ```
