@@ -1,48 +1,166 @@
 #Packages
 ```{r}
-library(tidyverse)
-library(plyr)
-library(brms)
-library(performance)
-library(effectsize)
-library(stats)
-library(latex2exp)
-library(ggplot2)
-library(lme4)
-library(lmerTest)
-library(tidybayes)
+library(tidyverse)     #Data management
+library(brms)          #Bayesian regression models using Stan
+library(performance)   #Model checks
+library(effectsize)    #Cohen's d_s and d_z
+library(stats)         #Modeling functions
+library(ggplot2)       #Visualization
+library(latex2exp)     #LaTeX support for ggplot2
+library(lme4)          #Frequentist' multilevel modeling
+library(lmerTest)      #Significance testing for frequentist' models
+library(tidybayes)     #Manipulation of posterior distributions
 
 #Global Settings
-set.seed(0)
-size <- 18
-
-#Load Pre-Sampled Models
-load("models/ANOVA_1.RObject")
-load("models/ANOVA_1_skew.RObject")
-load("models/ANOVA_2.RObject")
-load("models/ANOVA_3.RObject")
-load("models/ANOVA_3_student.RObject")
+set.seed(0)            #Fixed seed for reproducibility
+size <- 18             #Font size in ggplot2 graphics
 ```
 
 #Functions
+##Pooled SMD
 ```{r}
-#This is the main function used to extract all posterior samples from the 4 Markov chains
-get_chains <- function(brmsmodel){
-  chain.1 <- as.data.frame(as_draws(brmsmodel)[1]) %>% rename_all(~stringr::str_replace(.,"^X1.",""))
-  chain.2 <- as.data.frame(as_draws(brmsmodel)[2]) %>% rename_all(~stringr::str_replace(.,"^X2.",""))
-  chain.3 <- as.data.frame(as_draws(brmsmodel)[3]) %>% rename_all(~stringr::str_replace(.,"^X3.",""))
-  chain.4 <- as.data.frame(as_draws(brmsmodel)[4]) %>% rename_all(~stringr::str_replace(.,"^X4.",""))
+# This is the main function for computing the posterior mean and standard deviation
+# of the cluster-adjusted d_s as well as all estimates d_s(l) for each class via
+# partial pooling. The brmsfit input must be of the specific location-scale form 
+# y ~ cond + (0 + cond|class), sigma ~ 0 + cond + (0 + cond|class)
+pooled_smd <- function(brmsfit){
+  draws <- as_draws_df(brmsfit)
 
-  chains <- suppressMessages(join_all(list(chain.1, chain.2, chain.3, chain.4), type = 'full'))
-  return(chains)
+  suppressWarnings(classwise_smd <- lapply(class_ids, function(j) {
+      name_u_0 <- paste0("r_class[", j, ",condControl]")
+      name_u_1 <- paste0("r_class[", j, ",condIntervention]")
+      draws %>%
+        dplyr::select(
+          .draw,
+          # Fixed effects
+          mu = b_Intercept,
+          kappa = b_condIntervention,
+          log_sigma_1 = b_sigma_condControl,
+          log_sigma_2 = b_sigma_condIntervention,
+          # Global random standard deviations
+          sd_1    = sd_class__condControl,
+          sd_2    = sd_class__condIntervention,
+          sd_sigma_1  = sd_class__sigma_condControl,
+          sd_sigma_2  = sd_class__sigma_condIntervention,
+          # Cluster-specific random effects
+          mu_l     = all_of(name_u_0),
+          kappa_l  = all_of(name_u_1),
+        ) %>%
+        mutate(
+          class = j, # Track cluster
+
+          V_1 = sd_1^2 + exp(2 * log_sigma_1 + 2 * sd_sigma_1^2),
+          V_2 = sd_2^2 + exp(2 * log_sigma_2 + 2 * sd_sigma_2^2),
+          var_glob = (1 - p_val) * V_1 + p_val * V_2,
+          smd = (kappa + kappa_l - mu_l) / sqrt(var_glob)
+        ) %>%
+        dplyr::select(class, .draw, smd)
+        }) %>%
+          bind_rows()
+      )
+
+  mean_smd_per_draw <- classwise_smd %>%
+    group_by(.draw) %>%
+    dplyr::summarize(
+      mean_smd = mean(smd),
+      sd_smd = sd(smd),
+      .groups = "drop"
+    )
+  
+  return(list(
+    mean_smd = mean_hdci(mean_smd_per_draw$mean_smd),
+    sd_smd = mean_hdci(mean_smd_per_draw$sd_smd),
+    mean_smd_cl = classwise_smd %>%
+      group_by(class) %>%
+      dplyr::summarize(
+        mean_smd = mean_hdci(smd)
+      )
+  ))
 }
+```
 
+##Paired SMD
+```{r}
+# This is the main function for computing the posterior mean and standard deviation
+# of the cluster-adjusted d_z as well as all estimates d_z(l) for each class via
+# partial pooling. The brmsfit input must be of the specific location-scale form 
+# y ~ 0 + cond + (0 + cond|class), sigma ~ 0 + cond + (0 + cond|class)
+paired_smd <- function(brmsfit){
+  draws <- as_draws_df(brmsfit)
+
+  suppressWarnings(classwise_smd <- lapply(class_ids, function(j) {
+      name_u_0 <- paste0("r_class[", j, ",condControl]")
+      name_u_1 <- paste0("r_class[", j, ",condIntervention]")
+      draws %>%
+        dplyr::select(
+          .draw,
+          # Fixed effects
+          gain_1 = b_condControl,
+          gain_2 = b_condIntervention,
+          log_sigma_1 = b_sigma_condControl,
+          log_sigma_2 = b_sigma_condIntervention,
+          # Global random standard deviations
+          sd_1    = sd_class__condControl,
+          sd_2    = sd_class__condIntervention,
+          sd_sigma_1  = sd_class__sigma_condControl,
+          sd_sigma_2  = sd_class__sigma_condIntervention,
+          # Cluster-specific random effects
+          u_1l  = all_of(name_u_0),
+          u_2l  = all_of(name_u_1),
+        ) %>%
+        mutate(
+          class = j, # Track cluster
+
+          V_1 = sd_1^2 + exp(2 * log_sigma_1 + 2 * sd_sigma_1^2),
+          V_2 = sd_2^2 + exp(2 * log_sigma_2 + 2 * sd_sigma_2^2),
+          smd_control = (gain_1 + u_1l) / sqrt(V_1),
+          smd_intervention = (gain_2 + u_2l) / sqrt(V_2)
+        ) %>%
+        dplyr::select(class, .draw, smd_control, smd_intervention)
+        }) %>%
+          bind_rows()
+      )
+
+  mean_smd_per_draw <- classwise_smd %>%
+    group_by(.draw) %>%
+    dplyr::summarize(
+      mean_smd_control = mean(smd_control),
+      sd_smd_control = sd(smd_control),
+      mean_smd_intervention = mean(smd_intervention),
+      sd_smd_intervention = sd(smd_intervention),
+      .groups = "drop"
+    )
+  
+  return(list(
+    mean_smd_control = mean_hdci(mean_smd_per_draw$mean_smd_control),
+    sd_smd_control = mean_hdci(mean_smd_per_draw$sd_smd_control),
+    mean_smd_control_cl = classwise_smd %>%
+      group_by(class) %>%
+      dplyr::summarize(
+        mean_smd_control = mean_hdci(smd_control)
+      ),
+    mean_smd_intervention = mean_hdci(mean_smd_per_draw$mean_smd_intervention),
+    sd_smd_intervention = mean_hdci(mean_smd_per_draw$sd_smd_intervention),
+    mean_smd_intervention_cl = classwise_smd %>%
+      group_by(class) %>%
+      dplyr::summarize(
+        mean_smd_intervention = mean_hdci(smd_intervention)
+      )
+  ))
+}
+```
+
+##ZOIB
+```{r}
 invlogit <- function(x){return(1/(1 + exp(-x)))}
 sigma_ZOIB <- function(mu, phi){return(sqrt((mu * (1 - mu))/(exp(phi) + 1)))}
 
 sdlog <- function(m, s) sqrt(log(1 + (s^2 / m^2)))
 meanlog <- function(m, s) log(m) - (sdlog(m, s)^2) / 2
+```
 
+##Monte Carlo Simulation Measures
+```{r}
 bias <- function(x, theta){
   if (theta == 0){
     return(round(100 * mean(x, na.rm = TRUE), 3))
@@ -129,6 +247,7 @@ intervention <- dat %>% filter(cond == "Intervention")
 n_1 <- nrow(control)#939
 n_2 <- nrow(intervention)#438
 n <- n_1 + n_2#1377
+p_val <- (438 - 1)/(1377 - 2)
 
 #Convert wide format of data to long format
 dat_long <- dat %>% pivot_longer(
@@ -139,17 +258,19 @@ dat_long <- dat %>% pivot_longer(
 
 dat_long <- dat_long %>% mutate(time = fct_relevel(time, "pre", "post"))
 
-#Violin Plot of Scores
+#Violin plot of scores
 ggplot(dat_long, aes(time, score, fill = cond)) +
   geom_violin(aes(fill = cond), trim = TRUE, alpha = 1/5, scale = "count") +
-  geom_boxplot(width = 0.1, position = position_dodge(0.9), alpha = 1/5) + stat_summary(fun=mean, colour="black", geom="point", shape=5, size=3, show.legend=TRUE,position = position_dodge(0.9)) + stat_summary(aes(label=round(after_stat(y),2)), geom="text", size=6, vjust = 0.5, hjust = -0.6, position = position_dodge(0.9)) + scale_x_discrete(labels = c("Pretest", "Posttest")) + xlab("") + ylim(0, 26) + ylab("Sum Score (Max. = 26 Points)") + theme_classic(base_size = size - 2) + labs(fill = "Condition") + scale_fill_grey() + scale_color_grey() + labs(color='') 
+  geom_boxplot(width = 0.1, position = position_dodge(0.9), alpha = 1/5) + stat_summary(fun=mean, colour="black", geom="point", shape=5, size=3, show.legend=TRUE,position = position_dodge(0.9)) + stat_summary(aes(label=round(after_stat(y),2)), geom="text", size=6, vjust = 0.5, hjust = -0.5, position = position_dodge(0.9)) + scale_x_discrete(labels = c("Pretest", "Posttest")) + xlab("") + ylim(0, 26) + ylab("Sum Score (Max. = 26 Points)") + theme_classic(base_size = size - 2) + labs(fill = "Condition") + scale_fill_grey() + scale_color_grey() + labs(color='') 
+
+class_ids <- unique(dat$class) # Extract all unique cluster names
 ```
 
 #Modelling Aspects
 ##Bayesian Repeated-Measures ANOVA Model (no multilevel structure, no heterogeneous residual variances)
 ###Gaussian Distribution
 ```{r}
-#Default Settings in brms:
+#Default settings in brms:
 # - Number of MCMC chains = 4
 # - iter = 2000
 # - warm-up = floor(iter/2) = 1000
@@ -386,10 +507,6 @@ performance::variance_decomposition(icc, ci = 0.95)
 # ## Difference in Variances
 # Difference: 3.81  CI 95%: [1.34 6.34]
 
-#General Model Check
-check_model(lmer(score ~ 0 + time * cond + (1|id) + (0 + time * cond||class), data = dat_long))
-check_normality(lmer(score ~ 0 + time * cond + (1|id) + (0 + time * cond||class), data = dat_long))
-
 ANOVA_3 <- brm(
   bf(score ~ 0 + time * cond + (1|id) + (0 + time * cond|class), 
      sigma ~ 0 + time * cond + (0 + time * cond|class)), 
@@ -506,7 +623,7 @@ summary(ANOVA_3, prob = 0.95)
 # scale reduction factor on split chains (at convergence, Rhat = 1).
 # summary(ANOVA_3, prob = 0.90)
 
-#Prior Sensitivity Check via LOO
+#Sensitivity Check via LOO
 ANOVA_3_student <- brm(
   bf(score ~ 0 + time * cond + (1|id) + (0 + time * cond|class), 
      sigma ~ 0 + time * cond + (0 + time * cond|class)), 
@@ -545,7 +662,11 @@ loo_student <- loo(ANOVA_3_student)
 loo_compare(loo, loo_student)
 #                 elpd_diff se_diff
 # ANOVA_3          0.0       0.0   
-# ANOVA_3_student -7.6       1.8   
+# ANOVA_3_student -6.4       1.8
+#
+# Because |elpd_diff| > 4 and |elpd_diff| > 2 * se_diff, there is a mild advantage
+# of the model using a Gaussian target distribution. Ideally, |elpd_diff| >> 4 and
+# |elpd_diff| > 4 * se_diff for robust differences.
 ```
 
 #Between-Group Design
@@ -626,24 +747,15 @@ summary(ttest_pr_gaussian_flat, prob = 0.95)
 # Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
 # and Tail_ESS are effective sample size measures, and Rhat is the potential
 # scale reduction factor on split chains (at convergence, Rhat = 1).
-chains_ttest_pr <- get_chains(ttest_pr_gaussian_flat)
 
-for (l in 1:length(unique(dat$class))) {
-  name <- paste0("d_s_", l, "")
-  name_control <- paste0("r_class.", l, ".condControl.")
-  name_intervention <- paste0("r_class.", l, ".condIntervention.")
-  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
-  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
-  
-  chains_ttest_pr[[name]] <- sqrt(n - 2) * (chains_ttest_pr$b_condIntervention + chains_ttest_pr[names(chains_ttest_pr) == name_intervention] - chains_ttest_pr[names(chains_ttest_pr) == name_control])/sqrt((n_1 - 1) * (exp(2 * chains_ttest_pr$b_sigma_condControl + 2 * chains_ttest_pr[names(chains_ttest_pr) == name_sigma_control] + 2 * chains_ttest_pr$sd_class__sigma_condControl^2) + chains_ttest_pr$sd_class__condControl^2) + (n_2 - 1) * (exp(2 * chains_ttest_pr$b_sigma_condIntervention + 2 * chains_ttest_pr[names(chains_ttest_pr) == name_sigma_intervention] + 2 * chains_ttest_pr$sd_class__sigma_condIntervention^2) + chains_ttest_pr$sd_class__condIntervention^2))
-}
-
-chains_ttest_pr$d_s_mean <- rowMeans(subset(chains_ttest_pr, select = c(d_s_1:d_s_62)), na.rm = TRUE)
-d_s_pr <- round(mean(chains_ttest_pr$d_s_mean), 2) #0.24
-bayestestR::hdi(chains_ttest_pr$d_s_mean, ci = 0.95) #95% HDI: [0.09, 0.38]
-chains_ttest_pr$d_s_sd <- apply(subset(chains_ttest_pr, select = c(d_s_1:d_s_62)), 1, sd)
-d_s_sd_pr <- round(mean(chains_ttest_pr$d_s_sd), 2) #0.25
-bayestestR::hdi(chains_ttest_pr$d_s_sd, ci = 0.95) #95% HDI: [0.10, 0.42]
+fit_ttest_pr_gaussian_flat <- pooled_smd(ttest_pr_gaussian_flat)
+# $mean_smd
+#           y      ymin      ymax .width .point .interval
+# 1 0.2399661 0.0928819 0.3809791   0.95   mean      hdci
+# 
+# $sd_smd
+#          y       ymin      ymax .width .point .interval
+# 1 0.253731 0.09241755 0.4145247   0.95   mean      hdci
 ```
 
 ####Normal Priors
@@ -654,7 +766,7 @@ ttest_pr_gaussian_normal <- brm(bf(
   family = gaussian(),
   data = dat,
   prior = c(
-    prior(normal(13, 7), class = "b"),
+    prior(normal(13, 13), class = "b"),
     prior(normal(1, 2), class = "b", dpar = "sigma")
   ),
   warmup = 2500,
@@ -708,24 +820,14 @@ summary(ttest_pr_gaussian_normal, prob = 0.95)
 # Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
 # and Tail_ESS are effective sample size measures, and Rhat is the potential
 # scale reduction factor on split chains (at convergence, Rhat = 1).
-chains_ttest_pr <- get_chains(ttest_pr_gaussian_normal)
-
-for (l in 1:length(unique(dat$class))) {
-  name <- paste0("d_s_", l, "")
-  name_control <- paste0("r_class.", l, ".condControl.")
-  name_intervention <- paste0("r_class.", l, ".condIntervention.")
-  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
-  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
-  
-  chains_ttest_pr[[name]] <- sqrt(n - 2) * (chains_ttest_pr$b_condIntervention + chains_ttest_pr[names(chains_ttest_pr) == name_intervention] - chains_ttest_pr[names(chains_ttest_pr) == name_control])/sqrt((n_1 - 1) * (exp(2 * chains_ttest_pr$b_sigma_condControl + 2 * chains_ttest_pr[names(chains_ttest_pr) == name_sigma_control] + 2 * chains_ttest_pr$sd_class__sigma_condControl^2) + chains_ttest_pr$sd_class__condControl^2) + (n_2 - 1) * (exp(2 * chains_ttest_pr$b_sigma_condIntervention + 2 * chains_ttest_pr[names(chains_ttest_pr) == name_sigma_intervention] + 2 * chains_ttest_pr$sd_class__sigma_condIntervention^2) + chains_ttest_pr$sd_class__condIntervention^2))
-}
-
-chains_ttest_pr$d_s_mean <- rowMeans(subset(chains_ttest_pr, select = c(d_s_1:d_s_62)), na.rm = TRUE)
-round(mean(chains_ttest_pr$d_s_mean), 2) #0.25
-bayestestR::hdi(chains_ttest_pr$d_s_mean, ci = 0.95) #95% HDI: [0.10, 0.38]
-chains_ttest_pr$d_s_sd <- apply(subset(chains_ttest_pr, select = c(d_s_1:d_s_62)), 1, sd)
-round(mean(chains_ttest_pr$d_s_sd), 2) #0.25
-bayestestR::hdi(chains_ttest_pr$d_s_sd, ci = 0.95) #95% HDI: [0.10, 0.42]
+fit_ttest_pr_gaussian_normal <- pooled_smd(ttest_pr_gaussian_normal)
+# $mean_smd
+#           y       ymin      ymax .width .point .interval
+# 1 0.2435618 0.09814979 0.3834703   0.95   mean      hdci
+# 
+# $sd_smd
+#           y       ymin      ymax .width .point .interval
+# 1 0.2493178 0.09079369 0.4083103   0.95   mean      hdci
 ```
 
 ###Skew-Normal Distribution
@@ -791,24 +893,14 @@ summary(ttest_pr_skew_flat, prob = 0.95)
 # Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
 # and Tail_ESS are effective sample size measures, and Rhat is the potential
 # scale reduction factor on split chains (at convergence, Rhat = 1).
-chains_ttest_pr <- get_chains(ttest_pr_skew_flat)
-
-for (l in 1:length(unique(dat$class))) {
-  name <- paste0("d_s_", l, "")
-  name_control <- paste0("r_class.", l, ".condControl.")
-  name_intervention <- paste0("r_class.", l, ".condIntervention.")
-  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
-  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
-  
-  chains_ttest_pr[[name]] <- sqrt(n - 2) * (chains_ttest_pr$b_condIntervention + chains_ttest_pr[names(chains_ttest_pr) == name_intervention] - chains_ttest_pr[names(chains_ttest_pr) == name_control])/sqrt((n_1 - 1) * (exp(2 * chains_ttest_pr$b_sigma_condControl + 2 * chains_ttest_pr[names(chains_ttest_pr) == name_sigma_control] + 2 * chains_ttest_pr$sd_class__sigma_condControl^2) + chains_ttest_pr$sd_class__condControl^2) + (n_2 - 1) * (exp(2 * chains_ttest_pr$b_sigma_condIntervention + 2 * chains_ttest_pr[names(chains_ttest_pr) == name_sigma_intervention] + 2 * chains_ttest_pr$sd_class__sigma_condIntervention^2) + chains_ttest_pr$sd_class__condIntervention^2))
-}
-
-chains_ttest_pr$d_s_mean <- rowMeans(subset(chains_ttest_pr, select = c(d_s_1:d_s_62)), na.rm = TRUE)
-round(mean(chains_ttest_pr$d_s_mean), 2) #0.24
-bayestestR::hdi(chains_ttest_pr$d_s_mean, ci = 0.95) #95% HDI: [0.10, 0.39]
-chains_ttest_pr$d_s_sd <- apply(subset(chains_ttest_pr, select = c(d_s_1:d_s_62)), 1, sd)
-round(mean(chains_ttest_pr$d_s_sd), 2) #0.26
-bayestestR::hdi(chains_ttest_pr$d_s_sd, ci = 0.95) #95% HDI: [0.10, 0.42]
+fit_ttest_pr_skew_flat <- pooled_smd(ttest_pr_skew_flat)
+# $mean_smd
+#           y       ymin      ymax .width .point .interval
+# 1 0.2440682 0.09664405 0.3879475   0.95   mean      hdci
+# 
+# $sd_smd
+#           y      ymin      ymax .width .point .interval
+# 1 0.2570045 0.1015577 0.4159815   0.95   mean      hdci
 ```
 
 ####Normal Priors
@@ -819,7 +911,7 @@ ttest_pr_skew_normal <- brm(bf(
   family = skew_normal(),
   data = dat,
   prior = c(
-    prior(normal(13, 7), class = "b"),
+    prior(normal(13, 13), class = "b"),
     prior(normal(1, 2), class = "b", dpar = "sigma")
   ),
   warmup = 2500,
@@ -877,24 +969,14 @@ summary(ttest_pr_skew_normal, prob = 0.95)
 # Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
 # and Tail_ESS are effective sample size measures, and Rhat is the potential
 # scale reduction factor on split chains (at convergence, Rhat = 1).
-chains_ttest_pr <- get_chains(ttest_pr_skew_normal)
-
-for (l in 1:length(unique(dat$class))) {
-  name <- paste0("d_s_", l, "")
-  name_control <- paste0("r_class.", l, ".condControl.")
-  name_intervention <- paste0("r_class.", l, ".condIntervention.")
-  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
-  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
-  
-  chains_ttest_pr[[name]] <- sqrt(n - 2) * (chains_ttest_pr$b_condIntervention + chains_ttest_pr[names(chains_ttest_pr) == name_intervention] - chains_ttest_pr[names(chains_ttest_pr) == name_control])/sqrt((n_1 - 1) * (exp(2 * chains_ttest_pr$b_sigma_condControl + 2 * chains_ttest_pr[names(chains_ttest_pr) == name_sigma_control] + 2 * chains_ttest_pr$sd_class__sigma_condControl^2) + chains_ttest_pr$sd_class__condControl^2) + (n_2 - 1) * (exp(2 * chains_ttest_pr$b_sigma_condIntervention + 2 * chains_ttest_pr[names(chains_ttest_pr) == name_sigma_intervention] + 2 * chains_ttest_pr$sd_class__sigma_condIntervention^2) + chains_ttest_pr$sd_class__condIntervention^2))
-}
-
-chains_ttest_pr$d_s_mean <- rowMeans(subset(chains_ttest_pr, select = c(d_s_1:d_s_62)), na.rm = TRUE)
-round(mean(chains_ttest_pr$d_s_mean), 2) #0.25
-bayestestR::hdi(chains_ttest_pr$d_s_mean, ci = 0.95) #95% HDI: [0.11, 0.40]
-chains_ttest_pr$d_s_sd <- apply(subset(chains_ttest_pr, select = c(d_s_1:d_s_62)), 1, sd)
-round(mean(chains_ttest_pr$d_s_sd), 2) #0.25
-bayestestR::hdi(chains_ttest_pr$d_s_sd, ci = 0.95) #[0.10, 0.41]
+fit_ttest_pr_skew_normal <- pooled_smd(ttest_pr_skew_normal)
+# $mean_smd
+#           y      ymin      ymax .width .point .interval
+# 1 0.2455587 0.1020627 0.3878748   0.95   mean      hdci
+# 
+# $sd_smd
+#           y       ymin      ymax .width .point .interval
+# 1 0.2534061 0.09654372 0.4121028   0.95   mean      hdci
 ```
 
 ###Student-t Distribution
@@ -960,24 +1042,14 @@ summary(ttest_pr_t_flat, prob = 0.95)
 # Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
 # and Tail_ESS are effective sample size measures, and Rhat is the potential
 # scale reduction factor on split chains (at convergence, Rhat = 1).
-chains_ttest_pr <- get_chains(ttest_pr_t_flat)
-
-for (l in 1:length(unique(dat$class))) {
-  name <- paste0("d_s_", l, "")
-  name_control <- paste0("r_class.", l, ".condControl.")
-  name_intervention <- paste0("r_class.", l, ".condIntervention.")
-  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
-  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
-  
-  chains_ttest_pr[[name]] <- sqrt(n - 2) * (chains_ttest_pr$b_condIntervention + chains_ttest_pr[names(chains_ttest_pr) == name_intervention] - chains_ttest_pr[names(chains_ttest_pr) == name_control])/sqrt((n_1 - 1) * (exp(2 * chains_ttest_pr$b_sigma_condControl + 2 * chains_ttest_pr[names(chains_ttest_pr) == name_sigma_control] + 2 * chains_ttest_pr$sd_class__sigma_condControl^2) + chains_ttest_pr$sd_class__condControl^2) + (n_2 - 1) * (exp(2 * chains_ttest_pr$b_sigma_condIntervention + 2 * chains_ttest_pr[names(chains_ttest_pr) == name_sigma_intervention] + 2 * chains_ttest_pr$sd_class__sigma_condIntervention^2) + chains_ttest_pr$sd_class__condIntervention^2))
-}
-
-chains_ttest_pr$d_s_mean <- rowMeans(subset(chains_ttest_pr, select = c(d_s_1:d_s_62)), na.rm = TRUE)
-round(mean(chains_ttest_pr$d_s_mean), 2) #0.24
-bayestestR::hdi(chains_ttest_pr$d_s_mean, ci = 0.95) #95% HDI: [0.10, 0.39]
-chains_ttest_pr$d_s_sd <- apply(subset(chains_ttest_pr, select = c(d_s_1:d_s_62)), 1, sd)
-round(mean(chains_ttest_pr$d_s_sd), 2) #0.26
-bayestestR::hdi(chains_ttest_pr$d_s_sd, ci = 0.95) #95% HDI: [0.08, 0.42]
+fit_ttest_pr_t_flat <- pooled_smd(ttest_pr_t_flat)
+# $mean_smd
+#           y       ymin      ymax .width .point .interval
+# 1 0.2452378 0.09446999 0.3924517   0.95   mean      hdci
+# 
+# $sd_smd
+#           y       ymin      ymax .width .point .interval
+# 1 0.2561883 0.08153477 0.4224754   0.95   mean      hdci
 ```
 
 ####Normal Priors
@@ -1046,24 +1118,14 @@ summary(ttest_pr_t_normal, prob = 0.95)
 # Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
 # and Tail_ESS are effective sample size measures, and Rhat is the potential
 # scale reduction factor on split chains (at convergence, Rhat = 1).
-chains_ttest_pr <- get_chains(ttest_pr_t_normal)
-
-for (l in 1:length(unique(dat$class))) {
-  name <- paste0("d_s_", l, "")
-  name_control <- paste0("r_class.", l, ".condControl.")
-  name_intervention <- paste0("r_class.", l, ".condIntervention.")
-  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
-  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
-  
-  chains_ttest_pr[[name]] <- sqrt(n - 2) * (chains_ttest_pr$b_condIntervention + chains_ttest_pr[names(chains_ttest_pr) == name_intervention] - chains_ttest_pr[names(chains_ttest_pr) == name_control])/sqrt((n_1 - 1) * (exp(2 * chains_ttest_pr$b_sigma_condControl + 2 * chains_ttest_pr[names(chains_ttest_pr) == name_sigma_control] + 2 * chains_ttest_pr$sd_class__sigma_condControl^2) + chains_ttest_pr$sd_class__condControl^2) + (n_2 - 1) * (exp(2 * chains_ttest_pr$b_sigma_condIntervention + 2 * chains_ttest_pr[names(chains_ttest_pr) == name_sigma_intervention] + 2 * chains_ttest_pr$sd_class__sigma_condIntervention^2) + chains_ttest_pr$sd_class__condIntervention^2))
-}
-
-chains_ttest_pr$d_s_mean <- rowMeans(subset(chains_ttest_pr, select = c(d_s_1:d_s_62)), na.rm = TRUE)
-round(mean(chains_ttest_pr$d_s_mean), 2) #0.25
-bayestestR::hdi(chains_ttest_pr$d_s_mean, ci = 0.95) #95% HDI: [0.11, 0.40]
-chains_ttest_pr$d_s_sd <- apply(subset(chains_ttest_pr, select = c(d_s_1:d_s_62)), 1, sd)
-round(mean(chains_ttest_pr$d_s_sd), 2) #0.26
-bayestestR::hdi(chains_ttest_pr$d_s_sd, ci = 0.95) #95% HDI: [0.09, 0.42]
+fit_ttest_pr_t_normal <- pooled_smd(ttest_pr_t_normal)
+# $mean_smd
+#           y      ymin     ymax .width .point .interval
+# 1 0.2501877 0.1058326 0.396839   0.95   mean      hdci
+# 
+# $sd_smd
+#           y      ymin      ymax .width .point .interval
+# 1 0.2577263 0.0876006 0.4224414   0.95   mean      hdci
 ```
 
 ###Zero-One-Inflated Beta
@@ -1074,19 +1136,19 @@ dat <- dat %>% mutate(
   sr_post = post/26
 )
 
- ttest_pr_ZOIB_flat <- brm(bf(
-      sr_pre ~ 0 + cond,
-      phi ~ 0 + cond),
-      family = zero_one_inflated_beta(),
-    data = dat,
-    warmup = 2500,
-    iter = 5000,
-    cores = parallel::detectCores(),
-    control = list(adapt_delta = 0.95, max_treedepth = 15),
-    seed = 0
-  )
+ttest_pr_ZOIB_flat <- brm(bf(
+    sr_pre ~ 0 + cond,
+    phi ~ 0 + cond),
+    family = zero_one_inflated_beta(),
+  data = dat,
+  warmup = 2500,
+  iter = 5000,
+  cores = parallel::detectCores(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  seed = 0
+)
         
-plot(ttest_po_ZOIB_flat)
+plot(ttest_pr_ZOIB_flat)
 
 #Grouped pp-Checks
 #Dense Overlay
@@ -1122,18 +1184,38 @@ summary(ttest_pr_ZOIB_flat, prob = 0.95)
 # Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
 # and Tail_ESS are effective sample size measures, and Rhat is the potential
 # scale reduction factor on split chains (at convergence, Rhat = 1).
-chains_ttest_pr <- get_chains(ttest_pr_ZOIB_flat)
-
-mu_0 <- sapply(chains_ttest_pr$b_condControl, invlogit)
-mu_1 <- sapply(chains_ttest_pr$b_condIntervention, invlogit)
+draws <- as_draws_df(ttest_pr_ZOIB_flat)
   
-sigma_0 <- mapply(sigma_ZOIB, mu_0, unlist(chains_ttest_pr$b_phi_condControl))
-sigma_1 <-  mapply(sigma_ZOIB, mu_1, unlist(chains_ttest_pr$b_phi_condIntervention))
+draws <- draws %>%
+  dplyr::select(
+  .draw,
+  # Fixed effects
+  b_condControl,
+  b_condIntervention,
+  phi_1 = b_phi_condControl,
+  phi_2 = b_phi_condIntervention,
+  zoi,
+  coi
+  ) %>%
+  mutate(
+    mu_1 = invlogit(b_condControl),
+    mu_2 = invlogit(b_condIntervention),
+    mean_1 = zoi * coi + (1 - zoi) * mu_1, 
+    mean_2 = zoi * coi + (1 - zoi) * mu_2,
+    V_1 = (1 - zoi) * sigma_ZOIB(mu_1, phi_1)^2 + zoi * (1 - coi) * (0 - mean_1)^2 +
+  zoi * coi * (1 - mean_1)^2 +
+  (1 - zoi) * (mu_1 - mean_1)^2,
+    V_2 = (1 - zoi) * sigma_ZOIB(mu_2, phi_2)^2 + zoi * (1 - coi) * (0 - mean_2)^2 +
+  zoi * coi * (1 - mean_2)^2 +
+  (1 - zoi) * (mu_2 - mean_2)^2,
+    V = (1 - p_val) * V_1 + p_val * V_2,
+    smd = (mean_2 - mean_1) / sqrt(V)
+  ) %>%
+  dplyr::select(.draw, smd) %>% bind_rows()
   
-chains_ttest_pr$d_s <- sqrt(n - 2) * (mu_1 - mu_0)/sqrt((n_1 - 1) * sigma_0^2 + (n_2 - 1) * sigma_1^2)
-
-round(mean(chains_ttest_pr$d_s), 2) #0.29
-bayestestR::hdi(chains_ttest_pr$d_s, ci = 0.95) #95% HDI: [0.17, 0.40]
+mean_hdci(draws$smd)
+#           y      ymin     ymax .width .point .interval
+# 1 0.2905528 0.1734264 0.399067   0.95   mean      hdci
 ```
 
 ####Normal Priors
@@ -1190,18 +1272,38 @@ summary(ttest_pr_ZOIB_normal, prob = 0.95)
 # Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
 # and Tail_ESS are effective sample size measures, and Rhat is the potential
 # scale reduction factor on split chains (at convergence, Rhat = 1).
-chains_ttest_pr <- get_chains(ttest_pr_ZOIB_normal)
-
-mu_0 <- sapply(chains_ttest_pr$b_condControl, invlogit)
-mu_1 <- sapply(chains_ttest_pr$b_condIntervention, invlogit)
+draws <- as_draws_df(ttest_pr_ZOIB_normal)
   
-sigma_0 <- mapply(sigma_ZOIB, mu_0, unlist(chains_ttest_pr$b_phi_condControl))
-sigma_1 <-  mapply(sigma_ZOIB, mu_1, unlist(chains_ttest_pr$b_phi_condIntervention))
+draws <- draws %>%
+  dplyr::select(
+  .draw,
+  # Fixed effects
+  b_condControl,
+  b_condIntervention,
+  phi_1 = b_phi_condControl,
+  phi_2 = b_phi_condIntervention,
+  zoi,
+  coi
+  ) %>%
+  mutate(
+    mu_1 = invlogit(b_condControl),
+    mu_2 = invlogit(b_condIntervention),
+    mean_1 = zoi * coi + (1 - zoi) * mu_1, 
+    mean_2 = zoi * coi + (1 - zoi) * mu_2,
+    V_1 = (1 - zoi) * sigma_ZOIB(mu_1, phi_1)^2 + zoi * (1 - coi) * (0 - mean_1)^2 +
+  zoi * coi * (1 - mean_1)^2 +
+  (1 - zoi) * (mu_1 - mean_1)^2,
+    V_2 = (1 - zoi) * sigma_ZOIB(mu_2, phi_2)^2 + zoi * (1 - coi) * (0 - mean_2)^2 +
+  zoi * coi * (1 - mean_2)^2 +
+  (1 - zoi) * (mu_2 - mean_2)^2,
+    V = (1 - p_val) * V_1 + p_val * V_2,
+    smd = (mean_2 - mean_1) / sqrt(V)
+  ) %>%
+  dplyr::select(.draw, smd) %>% bind_rows()
   
-chains_ttest_pr$d_s <- sqrt(n - 2) * (mu_1 - mu_0)/sqrt((n_1 - 1) * sigma_0^2 + (n_2 - 1) * sigma_1^2)
-
-round(mean(chains_ttest_pr$d_s), 2) #0.29
-bayestestR::hdi(chains_ttest_pr$d_s, ci = 0.95) #95% HDI: [0.17, 0.40]
+mean_hdci(draws$smd)
+#          y      ymin      ymax .width .point .interval
+# 1 0.291117 0.1718748 0.4023646   0.95   mean      hdci
 ```
 
 ###Simulation Study
@@ -1235,7 +1337,6 @@ sd_sigma_1 <- 0.10  # Treatment condition random scale standard deviation
 rho_v <- 0.20         # Correlation random scale slopes 
 
 J_classes <- 62
-p_val <- (438 - 1)/(1377 - 2)
 
 loop <- function(r){
   # Generate correlated cluster-level location deviations (u_0j, u_1j)
@@ -1370,8 +1471,8 @@ loop <- function(r){
       mutate(
         clus = j, # Track cluster
 
-        V_0 = sd_0^2 + exp(2 * gamma_0 + 2 * sd_sigma_0^2 + 2 * v_0),
-        V_1 = sd_1^2 + exp(2 * gamma_1 + 2 * sd_sigma_1^2 + 2 * v_1),
+        V_0 = sd_0^2 + exp(2 * gamma_0 + 2 * sd_sigma_0^2),
+        V_1 = sd_1^2 + exp(2 * gamma_1 + 2 * sd_sigma_1^2),
         var_glob = (1 - p_val) * V_0 + p_val * V_1,
         hybrid_smd = (beta_1 + u_1 - u_0) / sqrt(var_glob)
       ) %>%
@@ -1491,18 +1592,26 @@ loop <- function(r){
     dplyr::select(
     .draw,
     # Fixed effects
-    beta_0 = b_cond0,
-    beta_1 = b_cond1,
-    phi_0 = b_phi_cond0,
-    phi_1 = b_phi_cond1
+    b_cond0,
+    b_cond1,
+    phi_1 = b_phi_cond0,
+    phi_2 = b_phi_cond1,
+    zoi,
+    coi
     ) %>%
     mutate(
-      mu_0 = invlogit(beta_0),
-      mu_1 = invlogit(beta_1),
-      V_0 = sigma_ZOIB(mu_0, phi_0)^2,
-      V_1 = sigma_ZOIB(mu_1, phi_1)^2,
-      V = (1 - p_val) * V_0 + p_val * V_1,
-      mean_hybrid_smd = (invlogit(beta_1) - invlogit(beta_0)) / sqrt(V)
+      mu_1 = invlogit(b_cond0),
+      mu_2 = invlogit(b_cond1),
+      mean_1 = zoi * coi + (1 - zoi) * mu_1, 
+      mean_2 = zoi * coi + (1 - zoi) * mu_2,
+      V_1 = (1 - zoi) * sigma_ZOIB(mu_1, phi_1)^2 + zoi * (1 - coi) * (0 - mean_1)^2 +
+        zoi * coi * (1 - mean_1)^2 +
+        (1 - zoi) * (mu_1 - mean_1)^2,
+      V_2 = (1 - zoi) * sigma_ZOIB(mu_2, phi_2)^2 + zoi * (1 - coi) * (0 - mean_2)^2 +
+        zoi * coi * (1 - mean_2)^2 +
+        (1 - zoi) * (mu_2 - mean_2)^2,
+      V = (1 - p_val) * V_1 + p_val * V_2,
+      mean_hybrid_smd = (mean_2 - mean_1) / sqrt(V)
     ) %>%
     dplyr::select(.draw, mean_hybrid_smd) %>% bind_rows()
     
@@ -1527,23 +1636,26 @@ save(estimates_d_s, file = "estimates_d_s.RObject")
 
 ####Results
 ```{r}
+load("data/estimates_d_s.RObject")
+n_rep <- 480
+
 full <- estimates_d_s %>% filter(model == "full")
 
-bias(full$estimate, unique(full$true_val)) #-0.061
-mse(full$estimate, unique(full$true_val)) #6.19
-mcse(full$estimate, unique(full$true_val)) #1.137
+bias(full$estimate, unique(full$true_val)) #0.139
+mse(full$estimate, unique(full$true_val)) #6.218
+mcse(full$estimate, unique(full$true_val)) #1.139
 
 red <- estimates_d_s %>% filter(model == "reduced")
 
-bias(red$estimate, unique(red$true_val)) #-5.829
+bias(red$estimate, unique(red$true_val)) #-5.831
 mse(red$estimate, unique(red$true_val)) #5.918
 mcse(red$estimate, unique(red$true_val)) #1.079
 
 ZOIB <- estimates_d_s %>% filter(model == "ZOIB")
 
-bias(ZOIB$estimate, unique(ZOIB$true_val)) #-7.732
-mse(ZOIB$estimate, unique(ZOIB$true_val)) #5.761
-mcse(ZOIB$estimate, unique(ZOIB$true_val)) #1.038
+bias(ZOIB$estimate, unique(ZOIB$true_val)) #-10.079
+mse(ZOIB$estimate, unique(ZOIB$true_val)) #5.911
+mcse(ZOIB$estimate, unique(ZOIB$true_val)) #1.011
 ```
 
 ##Posttest
@@ -1623,36 +1735,26 @@ summary(ttest_po_gaussian_flat, prob = 0.95)
 # Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
 # and Tail_ESS are effective sample size measures, and Rhat is the potential
 # scale reduction factor on split chains (at convergence, Rhat = 1).
-chains_ttest_po <- get_chains(ttest_po_gaussian_flat)
-
-for (l in 1:length(unique(dat$class))) {
-  name <- paste0("d_s_", l, "")
-  name_control <- paste0("r_class.", l, ".condControl.")
-  name_intervention <- paste0("r_class.", l, ".condIntervention.")
-  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
-  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
-  
-  chains_ttest_po[[name]] <- sqrt(n - 2) * (chains_ttest_po$b_condIntervention + chains_ttest_po[names(chains_ttest_po) == name_intervention] - chains_ttest_po[names(chains_ttest_po) == name_control])/sqrt((n_1 - 1) * (exp(2 * chains_ttest_po$b_sigma_condControl + 2 * chains_ttest_po[names(chains_ttest_po) == name_sigma_control] + 2 * chains_ttest_po$sd_class__sigma_condControl^2) + chains_ttest_po$sd_class__condControl^2) + (n_2 - 1) * (exp(2 * chains_ttest_po$b_sigma_condIntervention + 2 * chains_ttest_po[names(chains_ttest_po) == name_sigma_intervention] + 2 * chains_ttest_po$sd_class__sigma_condIntervention^2) + chains_ttest_po$sd_class__condIntervention^2))
-}
-
-chains_ttest_po$d_s_mean <- rowMeans(subset(chains_ttest_po, select = c(d_s_1:d_s_62)), na.rm = TRUE)
-d_s_po <- round(mean(chains_ttest_po$d_s_mean), 2) #0.23
-bayestestR::hdi(chains_ttest_po$d_s_mean, ci = 0.95) #95% HDI: [0.08, 0.38]
-chains_ttest_po$d_s_sd <- apply(subset(chains_ttest_po, select = c(d_s_1:d_s_62)), 1, sd)
-d_s_sd_po <- round(mean(chains_ttest_po$d_s_sd), 2) #0.34
-bayestestR::hdi(chains_ttest_po$d_s_sd, ci = 0.95) #95% HDI: [0.15, 0.54]
+fit_ttest_po_gaussian_flat <- pooled_smd(ttest_po_gaussian_flat)
+# $mean_smd
+#           y       ymin      ymax .width .point .interval
+# 1 0.2274629 0.08127428 0.3833775   0.95   mean      hdci
+# 
+# $sd_smd
+#           y      ymin      ymax .width .point .interval
+# 1 0.3417156 0.1358235 0.5352747   0.95   mean      hdci
 
 #Histogram
 random <- data.frame(
   cl = rep(1:62, 2),
   d_s = c(
-    colMeans(subset(chains_ttest_pr, select = c(d_s_1:d_s_62)), na.rm = TRUE),
-    colMeans(subset(chains_ttest_po, select = c(d_s_1:d_s_62)), na.rm = TRUE)
+    fit_ttest_pr_gaussian_flat$mean_smd_cl$mean_smd$y,
+    fit_ttest_po_gaussian_flat$mean_smd_cl$mean_smd$y
   ),
   Time = c(rep("Pretest", 62), rep("Posttest", 62)),
-  mean = c(rep(d_s_pr, 62), rep(d_s_po, 62)),
-  low = c(rep(d_s_pr - d_s_sd_pr, 62), rep(d_s_po - d_s_sd_po, 62)),
-  high = c(rep(d_s_pr + d_s_sd_pr, 62), rep(d_s_po + d_s_sd_po, 62))
+  mean = c(rep(fit_ttest_pr_gaussian_flat$mean_smd$y, 62), rep(fit_ttest_po_gaussian_flat$mean_smd$y, 62)),
+  low = c(rep(fit_ttest_pr_gaussian_flat$mean_smd$y - fit_ttest_pr_gaussian_flat$sd_smd$y, 62), rep(fit_ttest_po_gaussian_flat$mean_smd$y - fit_ttest_po_gaussian_flat$sd_smd$y, 62)),
+  high = c(rep(fit_ttest_pr_gaussian_flat$mean_smd$y + fit_ttest_pr_gaussian_flat$sd_smd$y, 62), rep(fit_ttest_po_gaussian_flat$mean_smd$y + fit_ttest_po_gaussian_flat$sd_smd$y, 62))
 )
 
 random <- random %>% mutate(Time = as.factor(Time))
@@ -1671,7 +1773,7 @@ ttest_po_gaussian_normal <- brm(bf(
   sigma ~ 0 + cond + (0 + cond|class)),
   family = gaussian(),
   prior = c(
-    prior(normal(13, 7), class = "b"),
+    prior(normal(13, 13), class = "b"),
     prior(normal(1, 2), class = "b", dpar = "sigma")
   ),
   data = dat,
@@ -1698,7 +1800,7 @@ pp_check(ttest_po_gaussian_normal, ndraws = 100, type = "pit_ecdf_grouped", grou
 pp_check(ttest_po_gaussian_normal, ndraws = 100, type = "pit_ecdf_grouped", group = "class")
 
 summary(ttest_po_gaussian_normal, prob = 0.95)
-# Family: gaussian 
+#  Family: gaussian 
 #   Links: mu = identity; sigma = log 
 # Formula: post ~ cond + (0 + cond | class) 
 #          sigma ~ 0 + cond + (0 + cond | class)
@@ -1709,41 +1811,31 @@ summary(ttest_po_gaussian_normal, prob = 0.95)
 # Multilevel Hyperparameters:
 # ~class (Number of levels: 62) 
 #                                               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
-# sd(condControl)                                   2.32      0.29     1.80     2.95 1.00     3078     5009
-# sd(condIntervention)                              1.99      0.38     1.34     2.80 1.00     4696     6698
-# sd(sigma_condControl)                             0.09      0.04     0.01     0.17 1.00     2338     1754
-# sd(sigma_condIntervention)                        0.08      0.06     0.00     0.22 1.00     3021     5136
-# cor(condControl,condIntervention)                 0.68      0.20     0.22     0.96 1.00     2613     4056
-# cor(sigma_condControl,sigma_condIntervention)    -0.13      0.57    -0.97     0.93 1.00     5012     5925
+# sd(condControl)                                   2.32      0.29     1.82     2.94 1.00     3324     6103
+# sd(condIntervention)                              2.00      0.38     1.33     2.82 1.00     4770     6849
+# sd(sigma_condControl)                             0.09      0.04     0.01     0.17 1.00     2360     2631
+# sd(sigma_condIntervention)                        0.08      0.06     0.00     0.22 1.00     2762     4690
+# cor(condControl,condIntervention)                 0.68      0.20     0.22     0.96 1.00     2797     4317
+# cor(sigma_condControl,sigma_condIntervention)    -0.14      0.57    -0.97     0.93 1.00     5673     6549
 # 
 # Regression Coefficients:
 #                        Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
-# Intercept                 15.30      0.35    14.62    15.97 1.00     2440     4488
-# condIntervention           1.15      0.43     0.30     2.00 1.00     6217     7075
-# sigma_condControl          1.44      0.03     1.38     1.49 1.00     8786     7683
-# sigma_condIntervention     1.47      0.04     1.38     1.54 1.00     7641     7312
+# Intercept                 15.32      0.35    14.63    16.00 1.00     2542     4504
+# condIntervention           1.11      0.43     0.30     1.97 1.00     5828     6594
+# sigma_condControl          1.44      0.03     1.38     1.49 1.00     9439     8064
+# sigma_condIntervention     1.47      0.04     1.38     1.55 1.00     7823     5985
 # 
 # Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
 # and Tail_ESS are effective sample size measures, and Rhat is the potential
 # scale reduction factor on split chains (at convergence, Rhat = 1).
-chains_ttest_po <- get_chains(ttest_po_gaussian_normal)
-
-for (l in 1:length(unique(dat$class))) {
-  name <- paste0("d_s_", l, "")
-  name_control <- paste0("r_class.", l, ".condControl.")
-  name_intervention <- paste0("r_class.", l, ".condIntervention.")
-  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
-  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
-  
-  chains_ttest_po[[name]] <- sqrt(n - 2) * (chains_ttest_po$b_condIntervention + chains_ttest_po[names(chains_ttest_po) == name_intervention] - chains_ttest_po[names(chains_ttest_po) == name_control])/sqrt((n_1 - 1) * (exp(2 * chains_ttest_po$b_sigma_condControl + 2 * chains_ttest_po[names(chains_ttest_po) == name_sigma_control] + 2 * chains_ttest_po$sd_class__sigma_condControl^2) + chains_ttest_po$sd_class__condControl^2) + (n_2 - 1) * (exp(2 * chains_ttest_po$b_sigma_condIntervention + 2 * chains_ttest_po[names(chains_ttest_po) == name_sigma_intervention] + 2 * chains_ttest_po$sd_class__sigma_condIntervention^2) + chains_ttest_po$sd_class__condIntervention^2))
-}
-
-chains_ttest_po$d_s_mean <- rowMeans(subset(chains_ttest_po, select = c(d_s_1:d_s_62)), na.rm = TRUE)
-round(mean(chains_ttest_po$d_s_mean), 2) #0.23
-bayestestR::hdi(chains_ttest_po$d_s_mean, ci = 0.95) #95% HDI: [0.09, 0.38]
-chains_ttest_po$d_s_sd <- apply(subset(chains_ttest_po, select = c(d_s_1:d_s_62)), 1, sd)
-round(mean(chains_ttest_po$d_s_sd), 2) #0.34
-bayestestR::hdi(chains_ttest_po$d_s_sd, ci = 0.95) #95% HDI: [0.14, 0.54]
+fit_ttest_po_gaussian_normal <- pooled_smd(ttest_po_gaussian_normal)
+# $mean_smd
+#           y       ymin      ymax .width .point .interval
+# 1 0.2294557 0.07967439 0.3787677   0.95   mean      hdci
+# 
+# $sd_smd
+#           y      ymin      ymax .width .point .interval
+# 1 0.3392633 0.1403539 0.5441276   0.95   mean      hdci
 ```
 
 ###Skew-Normal Distribution
@@ -1809,24 +1901,14 @@ summary(ttest_po_skew_flat, prob = 0.95)
 # Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
 # and Tail_ESS are effective sample size measures, and Rhat is the potential
 # scale reduction factor on split chains (at convergence, Rhat = 1).
-chains_ttest_po <- get_chains(ttest_po_skew_flat)
-
-for (l in 1:length(unique(dat$class))) {
-  name <- paste0("d_s_", l, "")
-  name_control <- paste0("r_class.", l, ".condControl.")
-  name_intervention <- paste0("r_class.", l, ".condIntervention.")
-  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
-  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
-  
-  chains_ttest_po[[name]] <- sqrt(n - 2) * (chains_ttest_po$b_condIntervention + chains_ttest_po[names(chains_ttest_po) == name_intervention] - chains_ttest_po[names(chains_ttest_po) == name_control])/sqrt((n_1 - 1) * (exp(2 * chains_ttest_po$b_sigma_condControl + 2 * chains_ttest_po[names(chains_ttest_po) == name_sigma_control] + 2 * chains_ttest_po$sd_class__sigma_condControl^2) + chains_ttest_po$sd_class__condControl^2) + (n_2 - 1) * (exp(2 * chains_ttest_po$b_sigma_condIntervention + 2 * chains_ttest_po[names(chains_ttest_po) == name_sigma_intervention] + 2 * chains_ttest_po$sd_class__sigma_condIntervention^2) + chains_ttest_po$sd_class__condIntervention^2))
-}
-
-chains_ttest_po$d_s_mean <- rowMeans(subset(chains_ttest_po, select = c(d_s_1:d_s_62)), na.rm = TRUE)
-round(mean(chains_ttest_po$d_s_mean), 2) #0.23
-bayestestR::hdi(chains_ttest_po$d_s_mean, ci = 0.95) #95% HDI: [0.07, 0.37]
-chains_ttest_po$d_s_sd <- apply(subset(chains_ttest_po, select = c(d_s_1:d_s_62)), 1, sd)
-round(mean(chains_ttest_po$d_s_sd), 2) #0.35
-bayestestR::hdi(chains_ttest_po$d_s_sd, ci = 0.95) #95% HDI: [0.14, 0.55]
+fit_ttest_po_skew_flat <- pooled_smd(ttest_po_skew_flat)
+# $mean_smd
+#          y       ymin      ymax .width .point .interval
+# 1 0.228282 0.07602958 0.3737543   0.95   mean      hdci
+# 
+# $sd_smd
+#           y      ymin      ymax .width .point .interval
+# 1 0.3493526 0.1364814 0.5448991   0.95   mean      hdci
 ```
 
 ####Normal Priors
@@ -1837,7 +1919,7 @@ ttest_po_skew_normal <- brm(bf(
   family = skew_normal(),
   data = dat,
   prior = c(
-    prior(normal(13, 7), class = "b"),
+    prior(normal(13, 13), class = "b"),
     prior(normal(1, 2), class = "b", dpar = "sigma")
   ),
   warmup = 2500,
@@ -1863,7 +1945,7 @@ pp_check(ttest_po_skew_normal, ndraws = 100, type = "pit_ecdf_grouped", group = 
 pp_check(ttest_po_skew_normal, ndraws = 100, type = "pit_ecdf_grouped", group = "class")
 
 summary(ttest_po_skew_normal, prob = 0.95)
-#  Family: skew_normal 
+# Family: skew_normal 
 #   Links: mu = identity; sigma = log 
 # Formula: post ~ cond + (0 + cond | class) 
 #          sigma ~ 0 + cond + (0 + cond | class)
@@ -1874,45 +1956,35 @@ summary(ttest_po_skew_normal, prob = 0.95)
 # Multilevel Hyperparameters:
 # ~class (Number of levels: 62) 
 #                                               Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
-# sd(condControl)                                   2.28      0.29     1.76     2.91 1.00     2910     5072
-# sd(condIntervention)                              1.92      0.37     1.30     2.72 1.00     3793     6102
-# sd(sigma_condControl)                             0.10      0.04     0.01     0.18 1.00     2192     1493
-# sd(sigma_condIntervention)                        0.08      0.06     0.00     0.21 1.00     2839     4751
-# cor(condControl,condIntervention)                 0.65      0.21     0.15     0.96 1.00     1903     3455
-# cor(sigma_condControl,sigma_condIntervention)    -0.12      0.57    -0.96     0.93 1.00     4468     5750
+# sd(condControl)                                   2.27      0.29     1.76     2.90 1.00     3134     5609
+# sd(condIntervention)                              1.92      0.36     1.29     2.71 1.00     4715     6481
+# sd(sigma_condControl)                             0.10      0.04     0.01     0.18 1.00     2375     2548
+# sd(sigma_condIntervention)                        0.08      0.06     0.00     0.22 1.00     2655     4472
+# cor(condControl,condIntervention)                 0.65      0.21     0.15     0.96 1.00     1971     2933
+# cor(sigma_condControl,sigma_condIntervention)    -0.11      0.57    -0.97     0.93 1.00     4859     5941
 # 
 # Regression Coefficients:
 #                        Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
-# Intercept                 15.32      0.34    14.63    15.98 1.00     2285     3412
-# condIntervention           1.14      0.43     0.31     2.01 1.00     4450     6163
-# sigma_condControl          1.45      0.03     1.39     1.51 1.00     7508     7307
-# sigma_condIntervention     1.46      0.04     1.37     1.54 1.00     7234     6469
+# Intercept                 15.33      0.34    14.65    15.98 1.00     2209     4316
+# condIntervention           1.10      0.43     0.28     1.98 1.00     5694     7535
+# sigma_condControl          1.45      0.03     1.39     1.51 1.00     8001     7442
+# sigma_condIntervention     1.46      0.04     1.37     1.54 1.00     8272     6858
 # 
 # Further Distributional Parameters:
 #       Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
-# alpha    -1.74      0.29    -2.33    -1.20 1.00    10422     7387
+# alpha    -1.75      0.28    -2.32    -1.22 1.00    10815     7696
 # 
 # Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
 # and Tail_ESS are effective sample size measures, and Rhat is the potential
 # scale reduction factor on split chains (at convergence, Rhat = 1).
-chains_ttest_po <- get_chains(ttest_po_skew_normal)
-
-for (l in 1:length(unique(dat$class))) {
-  name <- paste0("d_s_", l, "")
-  name_control <- paste0("r_class.", l, ".condControl.")
-  name_intervention <- paste0("r_class.", l, ".condIntervention.")
-  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
-  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
-  
-  chains_ttest_po[[name]] <- sqrt(n - 2) * (chains_ttest_po$b_condIntervention + chains_ttest_po[names(chains_ttest_po) == name_intervention] - chains_ttest_po[names(chains_ttest_po) == name_control])/sqrt((n_1 - 1) * (exp(2 * chains_ttest_po$b_sigma_condControl + 2 * chains_ttest_po[names(chains_ttest_po) == name_sigma_control] + 2 * chains_ttest_po$sd_class__sigma_condControl^2) + chains_ttest_po$sd_class__condControl^2) + (n_2 - 1) * (exp(2 * chains_ttest_po$b_sigma_condIntervention + 2 * chains_ttest_po[names(chains_ttest_po) == name_sigma_intervention] + 2 * chains_ttest_po$sd_class__sigma_condIntervention^2) + chains_ttest_po$sd_class__condIntervention^2))
-}
-
-chains_ttest_po$d_s_mean <- rowMeans(subset(chains_ttest_po, select = c(d_s_1:d_s_62)), na.rm = TRUE)
-round(mean(chains_ttest_po$d_s_mean), 2) #0.23
-bayestestR::hdi(chains_ttest_po$d_s_mean, ci = 0.95) #95% HDI: [0.09, 0.38]
-chains_ttest_po$d_s_sd <- apply(subset(chains_ttest_po, select = c(d_s_1:d_s_62)), 1, sd)
-round(mean(chains_ttest_po$d_s_sd), 2) #0.35
-bayestestR::hdi(chains_ttest_po$d_s_sd, ci = 0.95) #95% HDI: [0.14, 0.54]
+fit_ttest_po_skew_normal <- pooled_smd(ttest_po_skew_normal)
+# $mean_smd
+#           y       ymin      ymax .width .point .interval
+# 1 0.2282501 0.08083603 0.3791039   0.95   mean      hdci
+# 
+# $sd_smd
+#           y      ymin     ymax .width .point .interval
+# 1 0.3448152 0.1373227 0.546908   0.95   mean      hdci
 ```
 
 ###Student-t Distribution
@@ -1978,24 +2050,14 @@ summary(ttest_po_t_flat, prob = 0.95)
 # Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
 # and Tail_ESS are effective sample size measures, and Rhat is the potential
 # scale reduction factor on split chains (at convergence, Rhat = 1).
-chains_ttest_po <- get_chains(ttest_po_t_flat)
-
-for (l in 1:length(unique(dat$class))) {
-  name <- paste0("d_s_", l, "")
-  name_control <- paste0("r_class.", l, ".condControl.")
-  name_intervention <- paste0("r_class.", l, ".condIntervention.")
-  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
-  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
-  
-  chains_ttest_po[[name]] <- sqrt(n - 2) * (chains_ttest_po$b_condIntervention + chains_ttest_po[names(chains_ttest_po) == name_intervention] - chains_ttest_po[names(chains_ttest_po) == name_control])/sqrt((n_1 - 1) * (exp(2 * chains_ttest_po$b_sigma_condControl + 2 * chains_ttest_po[names(chains_ttest_po) == name_sigma_control] + 2 * chains_ttest_po$sd_class__sigma_condControl^2) + chains_ttest_po$sd_class__condControl^2) + (n_2 - 1) * (exp(2 * chains_ttest_po$b_sigma_condIntervention + 2 * chains_ttest_po[names(chains_ttest_po) == name_sigma_intervention] + 2 * chains_ttest_po$sd_class__sigma_condIntervention^2) + chains_ttest_po$sd_class__condIntervention^2))
-}
-
-chains_ttest_po$d_s_mean <- rowMeans(subset(chains_ttest_po, select = c(d_s_1:d_s_62)), na.rm = TRUE)
-round(mean(chains_ttest_po$d_s_mean), 2) #0.24
-bayestestR::hdi(chains_ttest_po$d_s_mean, ci = 0.95) #95% HDI: [0.08, 0.39]
-chains_ttest_po$d_s_sd <- apply(subset(chains_ttest_po, select = c(d_s_1:d_s_62)), 1, sd)
-round(mean(chains_ttest_po$d_s_sd), 2) #0.35
-bayestestR::hdi(chains_ttest_po$d_s_sd, ci = 0.95) #95% HDI: [0.15, 0.56]
+fit_ttest_po_t_flat <- pooled_smd(ttest_po_t_flat)
+# $mean_smd
+#          y       ymin      ymax .width .point .interval
+# 1 0.236679 0.08904093 0.3935075   0.95   mean      hdci
+# 
+# $sd_smd
+#           y      ymin      ymax .width .point .interval
+# 1 0.3531311 0.1463594 0.5614196   0.95   mean      hdci
 ```
 
 ####Normal Priors
@@ -2006,7 +2068,7 @@ ttest_po_t_normal <- brm(bf(
   family = student(),
   data = dat,
   prior = c(
-    prior(normal(13, 7), class = "b"),
+    prior(normal(13, 13), class = "b"),
     prior(normal(1, 2), class = "b", dpar = "sigma")
   ),
   warmup = 2500,
@@ -2064,24 +2126,14 @@ summary(ttest_po_t_normal, prob = 0.95)
 # Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
 # and Tail_ESS are effective sample size measures, and Rhat is the potential
 # scale reduction factor on split chains (at convergence, Rhat = 1).
-chains_ttest_po <- get_chains(ttest_po_t_normal)
-
-for (l in 1:length(unique(dat$class))) {
-  name <- paste0("d_s_", l, "")
-  name_control <- paste0("r_class.", l, ".condControl.")
-  name_intervention <- paste0("r_class.", l, ".condIntervention.")
-  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
-  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
-  
-  chains_ttest_po[[name]] <- sqrt(n - 2) * (chains_ttest_po$b_condIntervention + chains_ttest_po[names(chains_ttest_po) == name_intervention] - chains_ttest_po[names(chains_ttest_po) == name_control])/sqrt((n_1 - 1) * (exp(2 * chains_ttest_po$b_sigma_condControl + 2 * chains_ttest_po[names(chains_ttest_po) == name_sigma_control] + 2 * chains_ttest_po$sd_class__sigma_condControl^2) + chains_ttest_po$sd_class__condControl^2) + (n_2 - 1) * (exp(2 * chains_ttest_po$b_sigma_condIntervention + 2 * chains_ttest_po[names(chains_ttest_po) == name_sigma_intervention] + 2 * chains_ttest_po$sd_class__sigma_condIntervention^2) + chains_ttest_po$sd_class__condIntervention^2))
-}
-
-chains_ttest_po$d_s_mean <- rowMeans(subset(chains_ttest_po, select = c(d_s_1:d_s_62)), na.rm = TRUE)
-round(mean(chains_ttest_po$d_s_mean), 2) #0.24
-bayestestR::hdi(chains_ttest_po$d_s_mean, ci = 0.95) #95% HDI: [0.09, 0.39]
-chains_ttest_po$d_s_sd <- apply(subset(chains_ttest_po, select = c(d_s_1:d_s_62)), 1, sd)
-round(mean(chains_ttest_po$d_s_sd), 2) #0.36
-bayestestR::hdi(chains_ttest_po$d_s_sd, ci = 0.95) #95% HDI: [0.14, 0.56]
+fit_ttest_po_t_normal <- pooled_smd(ttest_po_t_normal)
+# $mean_smd
+#           y       ymin      ymax .width .point .interval
+# 1 0.2412729 0.08360313 0.3883012   0.95   mean      hdci
+# 
+# $sd_smd
+#           y      ymin     ymax .width .point .interval
+# 1 0.3518574 0.1563063 0.569128   0.95   mean      hdci
 ```
 
 ###Zero-One-Inflated Beta
@@ -2135,37 +2187,57 @@ summary(ttest_po_ZOIB_flat, prob = 0.95)
 # Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
 # and Tail_ESS are effective sample size measures, and Rhat is the potential
 # scale reduction factor on split chains (at convergence, Rhat = 1).
-chains_ttest_po <- get_chains(ttest_po_ZOIB_flat)
-
-mu_0 <- sapply(chains_ttest_po$b_condControl, invlogit)
-mu_1 <- sapply(chains_ttest_po$b_condIntervention, invlogit)
+draws <- as_draws_df(ttest_po_ZOIB_flat)
   
-sigma_0 <- mapply(sigma_ZOIB, mu_0, unlist(chains_ttest_po$b_phi_condControl))
-sigma_1 <-  mapply(sigma_ZOIB, mu_1, unlist(chains_ttest_po$b_phi_condIntervention))
+draws <- draws %>%
+  dplyr::select(
+  .draw,
+  # Fixed effects
+  b_condControl,
+  b_condIntervention,
+  phi_1 = b_phi_condControl,
+  phi_2 = b_phi_condIntervention,
+  zoi,
+  coi
+  ) %>%
+  mutate(
+    mu_1 = invlogit(b_condControl),
+    mu_2 = invlogit(b_condIntervention),
+    mean_1 = zoi * coi + (1 - zoi) * mu_1, 
+    mean_2 = zoi * coi + (1 - zoi) * mu_2,
+    V_1 = (1 - zoi) * sigma_ZOIB(mu_1, phi_1)^2 + zoi * (1 - coi) * (0 - mean_1)^2 +
+  zoi * coi * (1 - mean_1)^2 +
+  (1 - zoi) * (mu_1 - mean_1)^2,
+    V_2 = (1 - zoi) * sigma_ZOIB(mu_2, phi_2)^2 + zoi * (1 - coi) * (0 - mean_2)^2 +
+  zoi * coi * (1 - mean_2)^2 +
+  (1 - zoi) * (mu_2 - mean_2)^2,
+    V = (1 - p_val) * V_1 + p_val * V_2,
+    smd = (mean_2 - mean_1) / sqrt(V)
+  ) %>%
+  dplyr::select(.draw, smd) %>% bind_rows()
   
-chains_ttest_po$d_s <- sqrt(n - 2) * (mu_1 - mu_0)/sqrt((n_1 - 1) * sigma_0^2 + (n_2 - 1) * sigma_1^2)
-
-round(mean(chains_ttest_po$d_s), 2) #0.19
-bayestestR::hdi(chains_ttest_po$d_s, ci = 0.95) #95% HDI: [0.08, 0.31]
+mean_hdci(draws$smd)
+#           y       ymin      ymax .width .point .interval
+# 1 0.1864375 0.07599384 0.2961985   0.95   mean      hdci
 ```
 
 ####Normal Priors
 ```{r}
- ttest_po_ZOIB_normal <- brm(bf(
-      sr_post ~ 0 + cond,
-      phi ~ 0 + cond),
-      family = zero_one_inflated_beta(),
-    data = dat,
-    prior = c(
-      prior(normal(0, 1), class = "b"),
-      prior(normal(1, 2), class = "b", dpar = "phi")
-    ),
-    warmup = 2500,
-    iter = 5000,
-    cores = parallel::detectCores(),
-    control = list(adapt_delta = 0.95, max_treedepth = 15),
-    seed = 0
-  )
+ttest_po_ZOIB_normal <- brm(bf(
+    sr_post ~ 0 + cond,
+    phi ~ 0 + cond),
+    family = zero_one_inflated_beta(),
+  data = dat,
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(normal(1, 2), class = "b", dpar = "phi")
+  ),
+  warmup = 2500,
+  iter = 5000,
+  cores = parallel::detectCores(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  seed = 0
+)
         
 plot(ttest_po_ZOIB_normal)
 
@@ -2203,18 +2275,38 @@ summary(ttest_po_ZOIB_normal, prob = 0.95)
 # Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
 # and Tail_ESS are effective sample size measures, and Rhat is the potential
 # scale reduction factor on split chains (at convergence, Rhat = 1).
-chains_ttest_po <- get_chains(ttest_po_ZOIB_normal)
-
-mu_0 <- sapply(chains_ttest_po$b_condControl, invlogit)
-mu_1 <- sapply(chains_ttest_po$b_condIntervention, invlogit)
+draws <- as_draws_df(ttest_po_ZOIB_normal)
   
-sigma_0 <- mapply(sigma_ZOIB, mu_0, unlist(chains_ttest_po$b_phi_condControl))
-sigma_1 <-  mapply(sigma_ZOIB, mu_1, unlist(chains_ttest_po$b_phi_condIntervention))
+draws <- draws %>%
+  dplyr::select(
+  .draw,
+  # Fixed effects
+  b_condControl,
+  b_condIntervention,
+  phi_1 = b_phi_condControl,
+  phi_2 = b_phi_condIntervention,
+  zoi,
+  coi
+  ) %>%
+  mutate(
+    mu_1 = invlogit(b_condControl),
+    mu_2 = invlogit(b_condIntervention),
+    mean_1 = zoi * coi + (1 - zoi) * mu_1, 
+    mean_2 = zoi * coi + (1 - zoi) * mu_2,
+    V_1 = (1 - zoi) * sigma_ZOIB(mu_1, phi_1)^2 + zoi * (1 - coi) * (0 - mean_1)^2 +
+  zoi * coi * (1 - mean_1)^2 +
+  (1 - zoi) * (mu_1 - mean_1)^2,
+    V_2 = (1 - zoi) * sigma_ZOIB(mu_2, phi_2)^2 + zoi * (1 - coi) * (0 - mean_2)^2 +
+  zoi * coi * (1 - mean_2)^2 +
+  (1 - zoi) * (mu_2 - mean_2)^2,
+    V = (1 - p_val) * V_1 + p_val * V_2,
+    smd = (mean_2 - mean_1) / sqrt(V)
+  ) %>%
+  dplyr::select(.draw, smd) %>% bind_rows()
   
-chains_ttest_po$d_s <- sqrt(n - 2) * (mu_1 - mu_0)/sqrt((n_1 - 1) * sigma_0^2 + (n_2 - 1) * sigma_1^2)
-
-round(mean(chains_ttest_po$d_s), 2) #0.19
-bayestestR::hdi(chains_ttest_po$d_s, ci = 0.95) #95% HDI: [0.08, 0.30]
+mean_hdci(draws$smd)
+#           y       ymin      ymax .width .point .interval
+# 1 0.1865453 0.07800363 0.2990502   0.95   mean      hdci
 ```
 
 #Within-Group Design
@@ -2292,51 +2384,33 @@ summary(gain_gaussian_flat, prob = 0.95)
 # Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
 # and Tail_ESS are effective sample size measures, and Rhat is the potential
 # scale reduction factor on split chains (at convergence, Rhat = 1).
-chains_gain <- get_chains(gain_gaussian_flat)
-
-for (l in 1:length(unique(dat$class))) {
-  name <- paste0("d_z_", l, "_control")
-  name_control <- paste0("r_class.", l, ".condControl.")
-  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
-  
-  chains_gain[[name]] <- (chains_gain$b_condControl + chains_gain[names(chains_gain) == name_control])/sqrt(exp(2 * chains_gain$b_sigma_condControl + 2 * chains_gain[names(chains_gain) == name_sigma_control] + 2 * chains_gain$sd_class__sigma_condControl^2) + chains_gain$sd_class__condControl^2)
-}
-
-for (l in 1:length(unique(dat$class))) {
-  name <- paste0("d_z_", l, "_intervention")
-  name_intervention <- paste0("r_class.", l, ".condIntervention.")
-  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
-  
-  chains_gain[[name]] <- (chains_gain$b_condIntervention + chains_gain[names(chains_gain) == name_intervention])/sqrt(exp(2 * chains_gain$b_sigma_condIntervention + 2 * chains_gain[names(chains_gain) == name_sigma_intervention] + 2 * chains_gain$sd_class__sigma_condIntervention^2) + chains_gain$sd_class__condIntervention^2)
-}
-
-#Control Condition
-chains_gain$d_z_mean<- rowMeans(subset(chains_gain, select = c(d_z_1_control:d_z_62_control)), na.rm = TRUE)
-d_z_control <- round(mean(chains_gain$d_z_mean), 2) #1.17
-bayestestR::hdi(chains_gain$d_z_mean, ci = 0.95) #95% HDI: [1.07, 1.28]
-chains_gain$d_z_sd <- apply(subset(chains_gain, select = c(d_z_1_control:d_z_62_control)), 1, sd)
-d_z_sd_control <- round(mean(chains_gain$d_z_sd), 2) #0.48
-bayestestR::hdi(chains_gain$d_z_sd, ci = 0.95) #95% HDI: [0.42, 0.55]
-
-#Intervention Condition
-chains_gain$d_z_mean<- rowMeans(subset(chains_gain, select = c(d_z_1_intervention:d_z_62_intervention)), na.rm = TRUE)
-d_z_intervention <- round(mean(chains_gain$d_z_mean), 2) #1.25
-bayestestR::hdi(chains_gain$d_z_mean, ci = 0.95) #95% HDI: [1.08, 1.41]
-chains_gain$d_z_sd <- apply(subset(chains_gain, select = c(d_z_1_intervention:d_z_62_intervention)), 1, sd)
-d_z_sd_intervention <- round(mean(chains_gain$d_z_sd), 2) #0.42
-bayestestR::hdi(chains_gain$d_z_sd, ci = 0.95) #95% HDI: [0.31, 0.54]
+fit_gain_gaussian_flat <- paired_smd(gain_gaussian_flat)
+# $mean_smd_control
+#          y     ymin     ymax .width .point .interval
+# 1 1.172652 1.062091 1.277368   0.95   mean      hdci
+# 
+# $sd_smd_control
+#           y     ymin      ymax .width .point .interval
+# 1 0.4710229 0.409517 0.5336472   0.95   mean      hdci
+# $mean_smd_intervention
+#          y     ymin     ymax .width .point .interval
+# 1 1.244514 1.072514 1.412523   0.95   mean      hdci
+# 
+# $sd_smd_intervention
+#           y      ymin      ymax .width .point .interval
+# 1 0.4054991 0.2940985 0.5201336   0.95   mean      hdci
 
 #Histogram
 random <- data.frame(
   cl = rep(1:62, 2),
   d_z = c(
-    colMeans(subset(chains_gain, select = c(d_z_1_control:d_z_62_control)), na.rm = TRUE),
-    colMeans(subset(chains_gain, select = c(d_z_1_intervention:d_z_62_intervention)), na.rm = TRUE)
+    fit_gain_gaussian_flat$mean_smd_control_cl$mean_smd_control$y,
+    fit_gain_gaussian_flat$mean_smd_intervention_cl$mean_smd_intervention$y
   ),
   Condition = c(rep("Control", 62), rep("Intervention", 62)),
-  mean = c(rep(d_z_control, 62), rep(d_z_intervention, 62)),
-  low = c(rep(d_z_control - d_z_sd_control, 62), rep(d_z_intervention - d_z_sd_intervention, 62)),
-  high = c(rep(d_z_control + d_z_sd_control, 62), rep(d_z_intervention + d_z_sd_intervention, 62))
+  mean = c(rep(fit_gain_gaussian_flat$mean_smd_control$y, 62), rep(fit_gain_gaussian_flat$mean_smd_intervention$y, 62)),
+  low = c(rep(fit_gain_gaussian_flat$mean_smd_control$y - fit_gain_gaussian_flat$sd_smd_control$y, 62), rep(fit_gain_gaussian_flat$mean_smd_intervention$y - fit_gain_gaussian_flat$sd_smd_intervention$y, 62)),
+  high = c(rep(fit_gain_gaussian_flat$mean_smd_control$y + fit_gain_gaussian_flat$sd_smd_control$y, 62), rep(fit_gain_gaussian_flat$mean_smd_intervention$y + fit_gain_gaussian_flat$sd_smd_intervention$y, 62))
 )
 
 random <- random %>% mutate(Condition = as.factor(Condition))
@@ -2410,39 +2484,22 @@ summary(gain_gaussian_normal, prob = 0.95)
 # Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
 # and Tail_ESS are effective sample size measures, and Rhat is the potential
 # scale reduction factor on split chains (at convergence, Rhat = 1).
-chains_gain <- get_chains(gain_gaussian_normal)
-
-for (l in 1:length(unique(dat$class))) {
-  name <- paste0("d_z_", l, "_control")
-  name_control <- paste0("r_class.", l, ".condControl.")
-  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
-  
-  chains_gain[[name]] <- (chains_gain$b_condControl + chains_gain[names(chains_gain) == name_control])/sqrt(exp(2 * chains_gain$b_sigma_condControl + 2 * chains_gain[names(chains_gain) == name_sigma_control] + 2 * chains_gain$sd_class__sigma_condControl^2) + chains_gain$sd_class__condControl^2)
-}
-
-for (l in 1:length(unique(dat$class))) {
-  name <- paste0("d_z_", l, "_intervention")
-  name_intervention <- paste0("r_class.", l, ".condIntervention.")
-  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
-  
-  chains_gain[[name]] <- (chains_gain$b_condIntervention + chains_gain[names(chains_gain) == name_intervention])/sqrt(exp(2 * chains_gain$b_sigma_condIntervention + 2 * chains_gain[names(chains_gain) == name_sigma_intervention] + 2 * chains_gain$sd_class__sigma_condIntervention^2) + chains_gain$sd_class__condIntervention^2)
-}
-
-#Control Condition
-chains_gain$d_z_mean<- rowMeans(subset(chains_gain, select = c(d_z_1_control:d_z_62_control)), na.rm = TRUE)
-round(mean(chains_gain$d_z_mean), 2) #1.17
-bayestestR::hdi(chains_gain$d_z_mean, ci = 0.95) #95% HDI: [1.06, 1.28]
-chains_gain$d_z_sd <- apply(subset(chains_gain, select = c(d_z_1_control:d_z_62_control)), 1, sd)
-round(mean(chains_gain$d_z_sd), 2) #0.48
-bayestestR::hdi(chains_gain$d_z_sd, ci = 0.95) #95% HDI: [0.41, 0.55]
-
-#Intervention Condition
-chains_gain$d_z_mean<- rowMeans(subset(chains_gain, select = c(d_z_1_intervention:d_z_62_intervention)), na.rm = TRUE)
-round(mean(chains_gain$d_z_mean), 2) #1.25
-bayestestR::hdi(chains_gain$d_z_mean, ci = 0.95) #95% HDI: [1.08, 1.42]
-chains_gain$d_z_sd <- apply(subset(chains_gain, select = c(d_z_1_intervention:d_z_62_intervention)), 1, sd)
-round(mean(chains_gain$d_z_sd), 2) #0.42
-bayestestR::hdi(chains_gain$d_z_sd, ci = 0.95) #95% HDI: [0.30, 0.53]
+fit_gain_gaussian_normal <- paired_smd(gain_gaussian_normal)
+# $mean_smd_control
+#          y     ymin     ymax .width .point .interval
+# 1 1.172395 1.068484 1.284354   0.95   mean      hdci
+# 
+# $sd_smd_control
+#           y      ymin      ymax .width .point .interval
+# 1 0.4711959 0.4077896 0.5315505   0.95   mean      hdci
+# 
+# $mean_smd_intervention
+#          y     ymin     ymax .width .point .interval
+# 1 1.244994 1.077983 1.420602   0.95   mean      hdci
+# 
+# $sd_smd_intervention
+#           y      ymin     ymax .width .point .interval
+# 1 0.4069805 0.2941212 0.518922   0.95   mean      hdci
 ```
 
 ##Skew-Normal Distribution
@@ -2508,39 +2565,22 @@ summary(gain_skew_flat, prob = 0.95)
 # Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
 # and Tail_ESS are effective sample size measures, and Rhat is the potential
 # scale reduction factor on split chains (at convergence, Rhat = 1).
-chains_gain <- get_chains(gain_skew_flat)
-
-for (l in 1:length(unique(dat$class))) {
-  name <- paste0("d_z_", l, "_control")
-  name_control <- paste0("r_class.", l, ".condControl.")
-  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
-  
-  chains_gain[[name]] <- (chains_gain$b_condControl + chains_gain[names(chains_gain) == name_control])/sqrt(exp(2 * chains_gain$b_sigma_condControl + 2 * chains_gain[names(chains_gain) == name_sigma_control] + 2 * chains_gain$sd_class__sigma_condControl^2) + chains_gain$sd_class__condControl^2)
-}
-
-for (l in 1:length(unique(dat$class))) {
-  name <- paste0("d_z_", l, "_intervention")
-  name_intervention <- paste0("r_class.", l, ".condIntervention.")
-  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
-  
-  chains_gain[[name]] <- (chains_gain$b_condIntervention + chains_gain[names(chains_gain) == name_intervention])/sqrt(exp(2 * chains_gain$b_sigma_condIntervention + 2 * chains_gain[names(chains_gain) == name_sigma_intervention] + 2 * chains_gain$sd_class__sigma_condIntervention^2) + chains_gain$sd_class__condIntervention^2)
-}
-
-#Control Condition
-chains_gain$d_z_mean<- rowMeans(subset(chains_gain, select = c(d_z_1_control:d_z_62_control)), na.rm = TRUE)
-round(mean(chains_gain$d_z_mean), 2) #1.17
-bayestestR::hdi(chains_gain$d_z_mean, ci = 0.95) #95% HDI: [1.06, 1.27]
-chains_gain$d_z_sd <- apply(subset(chains_gain, select = c(d_z_1_control:d_z_62_control)), 1, sd)
-round(mean(chains_gain$d_z_sd), 2) #0.48
-bayestestR::hdi(chains_gain$d_z_sd, ci = 0.95) #95% HDI: [0.42, 0.55]
-
-#Intervention Condition
-chains_gain$d_z_mean<- rowMeans(subset(chains_gain, select = c(d_z_1_intervention:d_z_62_intervention)), na.rm = TRUE)
-round(mean(chains_gain$d_z_mean), 2) #1.25
-bayestestR::hdi(chains_gain$d_z_mean, ci = 0.95) #95% HDI: [1.08, 1.42]
-chains_gain$d_z_sd <- apply(subset(chains_gain, select = c(d_z_1_intervention:d_z_62_intervention)), 1, sd)
-round(mean(chains_gain$d_z_sd), 2) #0.42
-bayestestR::hdi(chains_gain$d_z_sd, ci = 0.95) #95% HDI: [0.30, 0.53]
+fit_gain_skew_flat <- paired_smd(gain_skew_flat)
+# $mean_smd_control
+#          y     ymin     ymax .width .point .interval
+# 1 1.171567 1.062774 1.278787   0.95   mean      hdci
+# 
+# $sd_smd_control
+#           y     ymin      ymax .width .point .interval
+# 1 0.4712406 0.409548 0.5339472   0.95   mean      hdci
+# 
+# $mean_smd_intervention
+#          y     ymin     ymax .width .point .interval
+# 1 1.244592 1.076109 1.418232   0.95   mean      hdci
+# 
+# $sd_smd_intervention
+#           y      ymin      ymax .width .point .interval
+# 1 0.4050887 0.2951842 0.5197298   0.95   mean      hdci
 ```
 
 ###Normal Priors
@@ -2609,39 +2649,22 @@ summary(gain_skew_normal, prob = 0.95)
 # Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
 # and Tail_ESS are effective sample size measures, and Rhat is the potential
 # scale reduction factor on split chains (at convergence, Rhat = 1).
-chains_gain <- get_chains(gain_skew_normal)
-
-for (l in 1:length(unique(dat$class))) {
-  name <- paste0("d_z_", l, "_control")
-  name_control <- paste0("r_class.", l, ".condControl.")
-  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
-  
-  chains_gain[[name]] <- (chains_gain$b_condControl + chains_gain[names(chains_gain) == name_control])/sqrt(exp(2 * chains_gain$b_sigma_condControl + 2 * chains_gain[names(chains_gain) == name_sigma_control] + 2 * chains_gain$sd_class__sigma_condControl^2) + chains_gain$sd_class__condControl^2)
-}
-
-for (l in 1:length(unique(dat$class))) {
-  name <- paste0("d_z_", l, "_intervention")
-  name_intervention <- paste0("r_class.", l, ".condIntervention.")
-  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
-  
-  chains_gain[[name]] <- (chains_gain$b_condIntervention + chains_gain[names(chains_gain) == name_intervention])/sqrt(exp(2 * chains_gain$b_sigma_condIntervention + 2 * chains_gain[names(chains_gain) == name_sigma_intervention] + 2 * chains_gain$sd_class__sigma_condIntervention^2) + chains_gain$sd_class__condIntervention^2)
-}
-
-#Control Condition
-chains_gain$d_z_mean<- rowMeans(subset(chains_gain, select = c(d_z_1_control:d_z_62_control)), na.rm = TRUE)
-round(mean(chains_gain$d_z_mean), 2) #1.17
-bayestestR::hdi(chains_gain$d_z_mean, ci = 0.95) #95% HDI: [1.07, 1.28]
-chains_gain$d_z_sd <- apply(subset(chains_gain, select = c(d_z_1_control:d_z_62_control)), 1, sd)
-round(mean(chains_gain$d_z_sd), 2) #0.48
-bayestestR::hdi(chains_gain$d_z_sd, ci = 0.95) #95% HDI: [0.42, 0.55]
-
-#Intervention Condition
-chains_gain$d_z_mean<- rowMeans(subset(chains_gain, select = c(d_z_1_intervention:d_z_62_intervention)), na.rm = TRUE)
-round(mean(chains_gain$d_z_mean), 2) #1.25
-bayestestR::hdi(chains_gain$d_z_mean, ci = 0.95) #95% HDI: [1.07, 1.42]
-chains_gain$d_z_sd <- apply(subset(chains_gain, select = c(d_z_1_intervention:d_z_62_intervention)), 1, sd)
-round(mean(chains_gain$d_z_sd), 2) #0.42
-bayestestR::hdi(chains_gain$d_z_sd, ci = 0.95) #95% HDI: [0.30, 0.53]
+fit_gain_skew_normal <- paired_smd(gain_skew_normal)
+# $mean_smd_control
+#          y     ymin    ymax .width .point .interval
+# 1 1.171197 1.065159 1.28375   0.95   mean      hdci
+# 
+# $sd_smd_control
+#           y      ymin     ymax .width .point .interval
+# 1 0.4711753 0.4084663 0.531776   0.95   mean      hdci
+# 
+# $mean_smd_intervention
+#          y     ymin     ymax .width .point .interval
+# 1 1.244299 1.069209 1.416069   0.95   mean      hdci
+# 
+# $sd_smd_intervention
+#           y      ymin      ymax .width .point .interval
+# 1 0.4047353 0.2911043 0.5162111   0.95   mean      hdci
 ```
 
 ##Student-t Distribution
@@ -2707,39 +2730,22 @@ summary(gain_t_flat, prob = 0.95)
 # Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
 # and Tail_ESS are effective sample size measures, and Rhat is the potential
 # scale reduction factor on split chains (at convergence, Rhat = 1).
-chains_gain <- get_chains(gain_t_flat)
-
-for (l in 1:length(unique(dat$class))) {
-  name <- paste0("d_z_", l, "_control")
-  name_control <- paste0("r_class.", l, ".condControl.")
-  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
-  
-  chains_gain[[name]] <- (chains_gain$b_condControl + chains_gain[names(chains_gain) == name_control])/sqrt(exp(2 * chains_gain$b_sigma_condControl + 2 * chains_gain[names(chains_gain) == name_sigma_control] + 2 * chains_gain$sd_class__sigma_condControl^2) + chains_gain$sd_class__condControl^2)
-}
-
-for (l in 1:length(unique(dat$class))) {
-  name <- paste0("d_z_", l, "_intervention")
-  name_intervention <- paste0("r_class.", l, ".condIntervention.")
-  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
-  
-  chains_gain[[name]] <- (chains_gain$b_condIntervention + chains_gain[names(chains_gain) == name_intervention])/sqrt(exp(2 * chains_gain$b_sigma_condIntervention + 2 * chains_gain[names(chains_gain) == name_sigma_intervention] + 2 * chains_gain$sd_class__sigma_condIntervention^2) + chains_gain$sd_class__condIntervention^2)
-}
-
-#Control Condition
-chains_gain$d_z_mean<- rowMeans(subset(chains_gain, select = c(d_z_1_control:d_z_62_control)), na.rm = TRUE)
-round(mean(chains_gain$d_z_mean), 2) #1.20
-bayestestR::hdi(chains_gain$d_z_mean, ci = 0.95) #95% HDI: [1.08, 1.31]
-chains_gain$d_z_sd <- apply(subset(chains_gain, select = c(d_z_1_control:d_z_62_control)), 1, sd)
-round(mean(chains_gain$d_z_sd), 2) #0.49
-bayestestR::hdi(chains_gain$d_z_sd, ci = 0.95) #95% HDI: [0.42, 0.56]
-
-#Intervention Condition
-chains_gain$d_z_mean<- rowMeans(subset(chains_gain, select = c(d_z_1_intervention:d_z_62_intervention)), na.rm = TRUE)
-round(mean(chains_gain$d_z_mean), 2) #1.27
-bayestestR::hdi(chains_gain$d_z_mean, ci = 0.95) #95% HDI: [1.09, 1.44]
-chains_gain$d_z_sd <- apply(subset(chains_gain, select = c(d_z_1_intervention:d_z_62_intervention)), 1, sd)
-round(mean(chains_gain$d_z_sd), 2) #0.43
-bayestestR::hdi(chains_gain$d_z_sd, ci = 0.95) #95% HDI: [0.31, 0.55]
+fit_gain_t_flat <- paired_smd(gain_t_flat)
+# $mean_smd_control
+#         y     ymin     ymax .width .point .interval
+# 1 1.19467 1.082891 1.308488   0.95   mean      hdci
+# 
+# $sd_smd_control
+#           y      ymin      ymax .width .point .interval
+# 1 0.4811369 0.4194251 0.5460346   0.95   mean      hdci
+# 
+# $mean_smd_intervention
+#          y     ymin    ymax .width .point .interval
+# 1 1.269463 1.086462 1.44262   0.95   mean      hdci
+# 
+# $sd_smd_intervention
+#           y    ymin      ymax .width .point .interval
+# 1 0.4143837 0.30005 0.5312685   0.95   mean      hdci
 ```
 
 ###Normal Priors
@@ -2808,39 +2814,22 @@ summary(gain_t_normal, prob = 0.95)
 # Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
 # and Tail_ESS are effective sample size measures, and Rhat is the potential
 # scale reduction factor on split chains (at convergence, Rhat = 1).
-chains_gain <- get_chains(gain_t_normal)
-
-for (l in 1:length(unique(dat$class))) {
-  name <- paste0("d_z_", l, "_control")
-  name_control <- paste0("r_class.", l, ".condControl.")
-  name_sigma_control <- paste0("r_class__sigma.", l, ".condControl.")
-  
-  chains_gain[[name]] <- (chains_gain$b_condControl + chains_gain[names(chains_gain) == name_control])/sqrt(exp(2 * chains_gain$b_sigma_condControl + 2 * chains_gain[names(chains_gain) == name_sigma_control] + 2 * chains_gain$sd_class__sigma_condControl^2) + chains_gain$sd_class__condControl^2)
-}
-
-for (l in 1:length(unique(dat$class))) {
-  name <- paste0("d_z_", l, "_intervention")
-  name_intervention <- paste0("r_class.", l, ".condIntervention.")
-  name_sigma_intervention <- paste0("r_class__sigma.", l, ".condIntervention.")
-  
-  chains_gain[[name]] <- (chains_gain$b_condIntervention + chains_gain[names(chains_gain) == name_intervention])/sqrt(exp(2 * chains_gain$b_sigma_condIntervention + 2 * chains_gain[names(chains_gain) == name_sigma_intervention] + 2 * chains_gain$sd_class__sigma_condIntervention^2) + chains_gain$sd_class__condIntervention^2)
-}
-
-#Control Condition
-chains_gain$d_z_mean<- rowMeans(subset(chains_gain, select = c(d_z_1_control:d_z_62_control)), na.rm = TRUE)
-round(mean(chains_gain$d_z_mean), 2) #1.20
-bayestestR::hdi(chains_gain$d_z_mean, ci = 0.95) #95% HDI: [1.08, 1.30]
-chains_gain$d_z_sd <- apply(subset(chains_gain, select = c(d_z_1_control:d_z_62_control)), 1, sd)
-round(mean(chains_gain$d_z_sd), 2) #0.49
-bayestestR::hdi(chains_gain$d_z_sd, ci = 0.95) #95% HDI: [0.43, 0.56]
-
-#Intervention Condition
-chains_gain$d_z_mean<- rowMeans(subset(chains_gain, select = c(d_z_1_intervention:d_z_62_intervention)), na.rm = TRUE)
-round(mean(chains_gain$d_z_mean), 2) #1.27
-bayestestR::hdi(chains_gain$d_z_mean, ci = 0.95) #95% HDI: [1.10, 1.45]
-chains_gain$d_z_sd <- apply(subset(chains_gain, select = c(d_z_1_intervention:d_z_62_intervention)), 1, sd)
-round(mean(chains_gain$d_z_sd), 2) #0.43
-bayestestR::hdi(chains_gain$d_z_sd, ci = 0.95) #95% HDI: [0.31, 0.54]
+fit_gain_t_normal <- paired_smd(gain_t_normal)
+# $mean_smd_control
+#          y    ymin     ymax .width .point .interval
+# 1 1.194668 1.07989 1.302535   0.95   mean      hdci
+# 
+# $sd_smd_control
+#           y     ymin      ymax .width .point .interval
+# 1 0.4819999 0.419128 0.5417142   0.95   mean      hdci
+# 
+# $mean_smd_intervention
+#          y    ymin     ymax .width .point .interval
+# 1 1.270576 1.10043 1.452359   0.95   mean      hdci
+# 
+# $sd_smd_intervention
+#           y      ymin    ymax .width .point .interval
+# 1 0.4139655 0.2929217 0.52472   0.95   mean      hdci
 ```
 
 ##Simulation Study
@@ -3006,8 +2995,8 @@ loop <- function(r){
       mutate(
         clus = j, # Track cluster
 
-        V_0 = sd_0^2 + exp(2 * gamma_0 + 2 * sd_sigma_0^2 + 2 * v_0),
-        V_1 = sd_1^2 + exp(2 * gamma_1 + 2 * sd_sigma_1^2 + 2 * v_1),
+        V_0 = sd_0^2 + exp(2 * gamma_0 + 2 * sd_sigma_0^2),
+        V_1 = sd_1^2 + exp(2 * gamma_1 + 2 * sd_sigma_1^2),
         smd_0 = (beta_0 + u_0) / sqrt(V_0),
         smd_1 = (beta_1 + u_1) / sqrt(V_1)
       ) %>%
@@ -3047,15 +3036,18 @@ save(estimates_d_z, file = "estimates_d_z.RObject")
 
 ###Results
 ```{r}
+load("data/estimates_d_z.RObject")
+n_rep <- 120
+
 cond_0 <- estimates_d_z %>% filter(model == "cond_0")
 
-bias(cond_0$estimate, unique(cond_0$true_val)) #0.462
-mse(cond_0$estimate, unique(cond_0$true_val)) #0.472
-mcse(cond_0$estimate, unique(cond_0$true_val)) #0.628
+bias(cond_0$estimate, unique(cond_0$true_val)) #0.335
+mse(cond_0$estimate, unique(cond_0$true_val)) #0.466
+mcse(cond_0$estimate, unique(cond_0$true_val)) #0.625
 
 cond_1 <- estimates_d_z %>% filter(model == "cond_1")
 
-bias(cond_1$estimate, unique(cond_1$true_val)) #0.439
-mse(cond_1$estimate, unique(cond_1$true_val)) #0.379
-mcse(cond_1$estimate, unique(cond_1$true_val)) #0.563
+bias(cond_1$estimate, unique(cond_1$true_val)) #0.181
+mse(cond_1$estimate, unique(cond_1$true_val)) #0.374
+mcse(cond_1$estimate, unique(cond_1$true_val)) #0.561
 ```
